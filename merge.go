@@ -243,7 +243,7 @@ func computeNewDocCount(segments []*SegmentBase, drops []*roaring.Bitmap) uint64
 
 func mergeTermFreqNormLocsByCopying(term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder *chunkedIntCoder, locEncoder *chunkedIntCoder) (
+	tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI) (
 	lastDocNum uint64, lastFreq uint64, lastNorm uint64, err error) {
 	nextDocNum, nextFreq, nextNorm, nextFreqNormBytes, nextLocBytes, err :=
 		postItr.nextBytes()
@@ -280,7 +280,7 @@ func mergeTermFreqNormLocsByCopying(term []byte, postItr *PostingsIterator,
 
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder *chunkedIntCoder, locEncoder *chunkedIntCoder, bufLoc []uint64) (
+	tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI, bufLoc []uint64) (
 	lastDocNum uint64, lastFreq uint64, lastNorm uint64, bufLocOut []uint64, err error) {
 	next, err := postItr.Next()
 	for next != nil && err == nil {
@@ -313,14 +313,23 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 		}
 
 		if len(locs) > 0 {
-			numBytesLocs := 0
-			for _, loc := range locs {
-				ap := loc.ArrayPositions()
-				numBytesLocs += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
-					loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
+			// For StreamVByte, store value count; for varint, store byte count
+			var locSizePrefix int
+			if UseStreamVByte {
+				// Count values: 5 per location + array positions
+				for _, loc := range locs {
+					locSizePrefix += 5 + len(loc.ArrayPositions())
+				}
+			} else {
+				// Count bytes for varint encoding
+				for _, loc := range locs {
+					ap := loc.ArrayPositions()
+					locSizePrefix += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
+						loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
+				}
 			}
 
-			err = locEncoder.Add(hitNewDocNum, uint64(numBytesLocs))
+			err = locEncoder.Add(hitNewDocNum, uint64(locSizePrefix))
 			if err != nil {
 				return 0, 0, 0, nil, err
 			}
@@ -354,7 +363,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 	return lastDocNum, lastFreq, lastNorm, bufLoc, err
 }
 
-func writePostings(postings *roaring.Bitmap, tfEncoder, locEncoder *chunkedIntCoder,
+func writePostings(postings *roaring.Bitmap, tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI,
 	use1HitEncoding func(uint64) (bool, uint64, uint64),
 	w *CountHashWriter, bufMaxVarintLen64 []byte) (
 	offset uint64, err error) {

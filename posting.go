@@ -215,7 +215,7 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 
 	// initialize the loc chunk reader
 	if rv.includeLocs {
-		rv.locReader = newChunkedIntDecoder(p.sb.mem, p.locOffset, rv.locReader)
+		rv.locReader = newStreamVByteChunkedIntDecoder(p.sb.mem, p.locOffset, rv.locReader)
 		rv.incrementBytesRead(rv.locReader.getBytesRead())
 	}
 
@@ -331,7 +331,7 @@ type PostingsIterator struct {
 
 	currChunk      uint32
 	freqNormReader *chunkedIntDecoder
-	locReader      *chunkedIntDecoder
+	locReader      *streamVByteChunkedIntDecoder
 
 	next            Posting            // reused across Next() calls
 	nextLocs        []Location         // reused across Next() calls

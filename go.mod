@@ -1,9 +1,10 @@
 module github.com/blevesearch/zapx/v17
 
-go 1.24
+go 1.26
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.4.5
+	github.com/ajroetker/go-highway v0.0.0-dev5
 	github.com/blevesearch/bleve_index_api v1.3.0
 	github.com/blevesearch/go-faiss v1.0.27
 	github.com/blevesearch/mmap-go v1.0.4
@@ -18,5 +19,5 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 )

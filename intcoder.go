@@ -26,6 +26,50 @@ import (
 // file)
 const termNotEncoded = 0
 
+// chunkedIntCoderI is the interface for chunked integer encoders.
+// Both chunkedIntCoder (legacy varint) and streamVByteChunkedIntCoder implement this.
+type chunkedIntCoderI interface {
+	Add(docNum uint64, vals ...uint64) error
+	AddBytes(docNum uint64, buf []byte) error
+	Close()
+	Reset()
+	SetChunkSize(chunkSize uint64, maxDocNum uint64)
+	Write(w io.Writer) (int, error)
+	writeAt(w io.Writer) (uint64, int, error)
+	FinalSize() int
+	getBytesWritten() uint64
+}
+
+// chunkedIntDecoderI is the interface for chunked integer decoders.
+// Both chunkedIntDecoder (legacy) and streamVByteChunkedIntDecoder implement this.
+type chunkedIntDecoderI interface {
+	loadChunk(chunk int) error
+	readUvarint() (uint64, error)
+	reset()
+	isNil() bool
+	getBytesRead() uint64
+	Len() int
+	SkipUvarint()
+	SkipBytes(count int)
+	remainingLen() int
+	readBytes(start, end int) []byte
+}
+
+// newLocEncoder creates the appropriate chunked int coder for location data.
+// Uses StreamVByte when UseStreamVByte is true, otherwise legacy varint.
+func newLocEncoder(chunkSize uint64, maxDocNum uint64) chunkedIntCoderI {
+	if UseStreamVByte {
+		return newStreamVByteChunkedIntCoder(chunkSize, maxDocNum)
+	}
+	return newChunkedIntCoder(chunkSize, maxDocNum)
+}
+
+// newLocDecoder creates the appropriate chunked int decoder for location data.
+// The StreamVByte decoder auto-detects the format and handles both legacy and new formats.
+func newLocDecoder(buf []byte, offset uint64, rv *streamVByteChunkedIntDecoder) *streamVByteChunkedIntDecoder {
+	return newStreamVByteChunkedIntDecoder(buf, offset, rv)
+}
+
 type chunkedIntCoder struct {
 	final     []byte
 	chunkSize uint64

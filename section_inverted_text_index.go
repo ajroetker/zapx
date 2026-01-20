@@ -97,7 +97,7 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(1024, newSegDocCount-1)
-	locEncoder := newChunkedIntCoder(1024, newSegDocCount-1)
+	locEncoder := newLocEncoder(1024, newSegDocCount-1)
 
 	var vellumBuf bytes.Buffer
 	newVellum, err := vellum.New(&vellumBuf, nil)
@@ -248,7 +248,9 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 			postItr = postings.iterator(true, true, true, postItr)
 
 			// can only safely copy data if all segments have same fields
-			if fieldsSame {
+			// and not using StreamVByte (StreamVByte decodes all values upfront,
+			// so we can't extract byte ranges for copying)
+			if fieldsSame && !UseStreamVByte {
 				// can optimize by copying freq/norm/loc bytes directly
 				lastDocNum, lastFreq, lastNorm, err = mergeTermFreqNormLocsByCopying(
 					term, postItr, newDocNums[itrI], newRoaring,
@@ -451,7 +453,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(1024, uint64(len(io.results)-1))
-	locEncoder := newChunkedIntCoder(1024, uint64(len(io.results)-1))
+	locEncoder := newLocEncoder(1024, uint64(len(io.results)-1))
 
 	var docTermMap [][]byte
 
@@ -517,14 +519,23 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				}
 
 				if freqNorm.numLocs > 0 {
-					numBytesLocs := 0
-					for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-						numBytesLocs += totalUvarintBytes(
-							uint64(loc.fieldID), loc.pos, loc.start, loc.end,
-							uint64(len(loc.arrayposs)), loc.arrayposs)
+					// For StreamVByte, store value count; for varint, store byte count
+					var locSizePrefix int
+					if UseStreamVByte {
+						// Count values: 5 per location + array positions
+						for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
+							locSizePrefix += 5 + len(loc.arrayposs)
+						}
+					} else {
+						// Count bytes for varint encoding
+						for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
+							locSizePrefix += totalUvarintBytes(
+								uint64(loc.fieldID), loc.pos, loc.start, loc.end,
+								uint64(len(loc.arrayposs)), loc.arrayposs)
+						}
 					}
 
-					err = locEncoder.Add(docNum, uint64(numBytesLocs))
+					err = locEncoder.Add(docNum, uint64(locSizePrefix))
 					if err != nil {
 						return err
 					}

@@ -733,3 +733,183 @@ func TestUnder32Bits(t *testing.T) {
 		t.Errorf("under32Bits wrong")
 	}
 }
+
+// =============================================================================
+// Merge Benchmarks
+// =============================================================================
+
+// buildBenchmarkSegment creates a segment with numDocs documents for benchmarking.
+// Each document has multiple fields with location data to exercise the location encoder/decoder.
+func buildBenchmarkSegment(numDocs int) (*SegmentBase, error) {
+	results := make([]index.Document, numDocs)
+
+	for i := 0; i < numDocs; i++ {
+		docID := fmt.Sprintf("doc%d", i)
+		// Create document with multiple fields and array positions to generate location data
+		doc := newStubDocument(docID, []*stubField{
+			newStubFieldSplitString("_id", nil, docID, true, false, false),
+			newStubFieldSplitString("title", nil, fmt.Sprintf("title words for document %d with more text", i), true, false, true),
+			newStubFieldSplitString("body", nil, fmt.Sprintf("body content with many words for document %d to create location data entries", i), true, false, true),
+			newStubFieldSplitString("tag", []uint64{0}, "alpha", true, false, true),
+			newStubFieldSplitString("tag", []uint64{1}, "beta", true, false, true),
+			newStubFieldSplitString("tag", []uint64{2}, "gamma", true, false, true),
+			newStubFieldSplitString("category", nil, fmt.Sprintf("cat%d", i%10), true, false, true),
+		}, "_all")
+		results[i] = doc
+	}
+
+	seg, _, err := zapPlugin.newWithChunkMode(results, DefaultChunkMode)
+	if err != nil {
+		return nil, err
+	}
+	return seg.(*SegmentBase), nil
+}
+
+// BenchmarkMerge benchmarks segment merging with Varint vs StreamVByte encoding
+func BenchmarkMerge(b *testing.B) {
+	sizes := []int{100, 500, 1000}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("Docs%d", size), func(b *testing.B) {
+			b.Run("Varint", func(b *testing.B) {
+				benchmarkMergeWithEncoding(b, size, false)
+			})
+			b.Run("StreamVByte", func(b *testing.B) {
+				benchmarkMergeWithEncoding(b, size, true)
+			})
+		})
+	}
+}
+
+func benchmarkMergeWithEncoding(b *testing.B, numDocs int, useStreamVByte bool) {
+	// Save and restore UseStreamVByte setting
+	origUseStreamVByte := UseStreamVByte
+	defer func() { UseStreamVByte = origUseStreamVByte }()
+
+	// Set encoding mode for segment creation
+	UseStreamVByte = useStreamVByte
+
+	// Create temp directory for benchmark files
+	tmpDir, err := os.MkdirTemp("", "zapx-bench-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Build two segments
+	seg1Path := tmpDir + "/seg1.zap"
+	seg2Path := tmpDir + "/seg2.zap"
+	mergedPath := tmpDir + "/merged.zap"
+
+	testSeg1, err := buildBenchmarkSegment(numDocs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := PersistSegmentBase(testSeg1, seg1Path); err != nil {
+		b.Fatal(err)
+	}
+
+	testSeg2, err := buildBenchmarkSegment(numDocs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := PersistSegmentBase(testSeg2, seg2Path); err != nil {
+		b.Fatal(err)
+	}
+
+	// Open segments
+	segment1, err := zapPlugin.Open(seg1Path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer segment1.Close()
+
+	segment2, err := zapPlugin.Open(seg2Path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer segment2.Close()
+
+	segsToMerge := []seg.Segment{segment1, segment2}
+	drops := []*roaring.Bitmap{nil, nil}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// Remove merged file from previous iteration
+		os.Remove(mergedPath)
+
+		_, _, err := zapPlugin.Merge(segsToMerge, drops, mergedPath, nil, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkMergeMultipleSegments benchmarks merging more than 2 segments
+func BenchmarkMergeMultipleSegments(b *testing.B) {
+	numSegments := []int{2, 4, 8}
+	docsPerSeg := 100
+
+	for _, numSegs := range numSegments {
+		b.Run(fmt.Sprintf("Segs%d", numSegs), func(b *testing.B) {
+			b.Run("Varint", func(b *testing.B) {
+				benchmarkMergeMultiple(b, numSegs, docsPerSeg, false)
+			})
+			b.Run("StreamVByte", func(b *testing.B) {
+				benchmarkMergeMultiple(b, numSegs, docsPerSeg, true)
+			})
+		})
+	}
+}
+
+func benchmarkMergeMultiple(b *testing.B, numSegments, docsPerSeg int, useStreamVByte bool) {
+	origUseStreamVByte := UseStreamVByte
+	defer func() { UseStreamVByte = origUseStreamVByte }()
+	UseStreamVByte = useStreamVByte
+
+	tmpDir, err := os.MkdirTemp("", "zapx-bench-multi-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Build and persist segments
+	segments := make([]seg.Segment, numSegments)
+	drops := make([]*roaring.Bitmap, numSegments)
+
+	for i := 0; i < numSegments; i++ {
+		segPath := fmt.Sprintf("%s/seg%d.zap", tmpDir, i)
+		testSeg, err := buildBenchmarkSegment(docsPerSeg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := PersistSegmentBase(testSeg, segPath); err != nil {
+			b.Fatal(err)
+		}
+
+		segment, err := zapPlugin.Open(segPath)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer segment.Close()
+
+		segments[i] = segment
+		drops[i] = nil
+	}
+
+	mergedPath := tmpDir + "/merged.zap"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		os.Remove(mergedPath)
+
+		_, _, err := zapPlugin.Merge(segments, drops, mergedPath, nil, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
