@@ -98,9 +98,16 @@ type PostingsList struct {
 	sb             *SegmentBase
 	postingsOffset uint64
 	freqOffset     uint64
-	locOffset      uint64
+	locOffset      uint64 // legacy: single interleaved stream
 	postings       *roaring.Bitmap
 	except         *roaring.Bitmap
+
+	// Separated field IDs format (when separatedLocs is true):
+	// - locFieldOffset: offset to field IDs stream (small values, need remapping)
+	// - locValuesOffset: offset to values stream (pos, start, end, etc - can copy directly)
+	separatedLocs   bool
+	locFieldOffset  uint64
+	locValuesOffset uint64
 
 	// when normBits1Hit != 0, then this postings list came from a
 	// 1-hit encoding, and only the docNum1Hit & normBits1Hit apply
@@ -170,6 +177,16 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 			locReader.reset()
 		}
 
+		locFieldReader := rv.locFieldReader
+		if locFieldReader != nil {
+			locFieldReader.reset()
+		}
+
+		locValuesReader := rv.locValuesReader
+		if locValuesReader != nil {
+			locValuesReader.reset()
+		}
+
 		nextLocs := rv.nextLocs[:0]
 		nextSegmentLocs := rv.nextSegmentLocs[:0]
 
@@ -179,6 +196,8 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 
 		rv.freqNormReader = freqNormReader
 		rv.locReader = locReader
+		rv.locFieldReader = locFieldReader
+		rv.locValuesReader = locValuesReader
 
 		rv.nextLocs = nextLocs
 		rv.nextSegmentLocs = nextSegmentLocs
@@ -213,10 +232,19 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		rv.incrementBytesRead(rv.freqNormReader.getBytesRead())
 	}
 
-	// initialize the loc chunk reader
+	// initialize the loc chunk reader(s)
 	if rv.includeLocs {
-		rv.locReader = newStreamVByteChunkedIntDecoder(p.sb.mem, p.locOffset, rv.locReader)
-		rv.incrementBytesRead(rv.locReader.getBytesRead())
+		if p.separatedLocs {
+			// Separated format: two streams (field IDs and values)
+			rv.locFieldReader = newStreamVByteChunkedIntDecoder(p.sb.mem, p.locFieldOffset, rv.locFieldReader)
+			rv.incrementBytesRead(rv.locFieldReader.getBytesRead())
+			rv.locValuesReader = newStreamVByteChunkedIntDecoder(p.sb.mem, p.locValuesOffset, rv.locValuesReader)
+			rv.incrementBytesRead(rv.locValuesReader.getBytesRead())
+		} else {
+			// Legacy format: single interleaved stream
+			rv.locReader = newStreamVByteChunkedIntDecoder(p.sb.mem, p.locOffset, rv.locReader)
+			rv.incrementBytesRead(rv.locReader.getBytesRead())
+		}
 	}
 
 	rv.all = p.postings.Iterator()
@@ -228,6 +256,15 @@ func (p *PostingsList) iterator(includeFreq, includeNorm, includeLocs bool,
 		rv.Actual = rv.all // Optimize to use same iterator for all & Actual.
 	}
 
+	return rv
+}
+
+// iteratorForMerge creates an iterator optimized for merge operations.
+// When UseStreamVByte is true, it skips Location object creation and
+// stores the value count for later use with ReadLocationValuesForMerge.
+func (p *PostingsList) iteratorForMerge(rv *PostingsIterator) *PostingsIterator {
+	rv = p.iterator(true, true, true, rv)
+	rv.mergeMode = UseStreamVByte
 	return rv
 }
 
@@ -283,8 +320,25 @@ func (rv *PostingsList) read(postingsOffset uint64, d *Dictionary) error {
 	rv.freqOffset, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+binary.MaxVarintLen64])
 	n += uint64(read)
 
-	rv.locOffset, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+n+binary.MaxVarintLen64])
-	n += uint64(read)
+	// Check for separated field IDs format marker (2-byte sequence 0xFF 0x00)
+	if postingsOffset+n+1 < uint64(len(d.sb.mem)) &&
+		d.sb.mem[postingsOffset+n] == SeparatedLocFormatMarker[0] &&
+		d.sb.mem[postingsOffset+n+1] == SeparatedLocFormatMarker[1] {
+		// Separated format: marker + locFieldOffset + locValuesOffset
+		rv.separatedLocs = true
+		n += 2 // skip 2-byte marker
+
+		rv.locFieldOffset, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+n+binary.MaxVarintLen64])
+		n += uint64(read)
+
+		rv.locValuesOffset, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+n+binary.MaxVarintLen64])
+		n += uint64(read)
+	} else {
+		// Legacy format: single locOffset
+		rv.separatedLocs = false
+		rv.locOffset, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+n+binary.MaxVarintLen64])
+		n += uint64(read)
+	}
 
 	var postingsLen uint64
 	postingsLen, read = binary.Uvarint(d.sb.mem[postingsOffset+n : postingsOffset+n+binary.MaxVarintLen64])
@@ -331,7 +385,11 @@ type PostingsIterator struct {
 
 	currChunk      uint32
 	freqNormReader *chunkedIntDecoder
-	locReader      *streamVByteChunkedIntDecoder
+	locReader      *streamVByteChunkedIntDecoder // legacy: single interleaved stream
+
+	// Separated field IDs format readers
+	locFieldReader  *streamVByteChunkedIntDecoder // field IDs stream
+	locValuesReader *streamVByteChunkedIntDecoder // values stream (pos, start, end, etc)
 
 	next            Posting            // reused across Next() calls
 	nextLocs        []Location         // reused across Next() calls
@@ -346,6 +404,11 @@ type PostingsIterator struct {
 	includeLocs     bool
 
 	bytesRead uint64
+
+	// mergeMode skips Location object creation for faster merge
+	mergeMode     bool
+	numLocValues  int // stored value count when in mergeMode (StreamVByte only)
+	numFieldIDs   int // number of field IDs when in mergeMode with separated format
 }
 
 var emptyPostingsIterator = &PostingsIterator{}
@@ -397,11 +460,27 @@ func (i *PostingsIterator) loadChunk(chunk int) error {
 	}
 
 	if i.includeLocs {
-		err := i.locReader.loadChunk(chunk)
-		if err != nil {
-			return err
+		if i.locFieldReader != nil {
+			// Separated format: load chunks for both readers
+			err := i.locFieldReader.loadChunk(chunk)
+			if err != nil {
+				return err
+			}
+			i.ResetBytesRead(i.locFieldReader.getBytesRead())
+
+			err = i.locValuesReader.loadChunk(chunk)
+			if err != nil {
+				return err
+			}
+			i.ResetBytesRead(i.locValuesReader.getBytesRead())
+		} else {
+			// Legacy format: single location reader
+			err := i.locReader.loadChunk(chunk)
+			if err != nil {
+				return err
+			}
+			i.ResetBytesRead(i.locReader.getBytesRead())
 		}
-		i.ResetBytesRead(i.locReader.getBytesRead())
 	}
 
 	i.currChunk = uint32(chunk)
@@ -468,30 +547,56 @@ func decodeFreqHasLocs(freqHasLocs uint64) (uint64, bool) {
 // readLocation processes all the integers on the stream representing a single
 // location.
 func (i *PostingsIterator) readLocation(l *Location) error {
-	// read off field
-	fieldID, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location field: %v", err)
-	}
-	// read off pos
-	pos, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location pos: %v", err)
-	}
-	// read off start
-	start, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location start: %v", err)
-	}
-	// read off end
-	end, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location end: %v", err)
-	}
-	// read off num array pos
-	numArrayPos, err := i.locReader.readUvarint()
-	if err != nil {
-		return fmt.Errorf("error reading location num array pos: %v", err)
+	var fieldID, pos, start, end, numArrayPos uint64
+	var err error
+
+	// Check if we're using separated field IDs format
+	if i.locFieldReader != nil {
+		// Separated format: read field ID from field stream
+		fieldID, err = i.locFieldReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location field: %v", err)
+		}
+
+		// Read values from values stream
+		pos, err = i.locValuesReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location pos: %v", err)
+		}
+		start, err = i.locValuesReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location start: %v", err)
+		}
+		end, err = i.locValuesReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location end: %v", err)
+		}
+		numArrayPos, err = i.locValuesReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location num array pos: %v", err)
+		}
+	} else {
+		// Legacy format: all values interleaved in single stream
+		fieldID, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location field: %v", err)
+		}
+		pos, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location pos: %v", err)
+		}
+		start, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location start: %v", err)
+		}
+		end, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location end: %v", err)
+		}
+		numArrayPos, err = i.locReader.readUvarint()
+		if err != nil {
+			return fmt.Errorf("error reading location num array pos: %v", err)
+		}
 	}
 
 	l.field = i.postings.sb.fieldsInv[fieldID]
@@ -507,7 +612,12 @@ func (i *PostingsIterator) readLocation(l *Location) error {
 
 	// read off array positions
 	for k := 0; k < int(numArrayPos); k++ {
-		ap, err := i.locReader.readUvarint()
+		var ap uint64
+		if i.locFieldReader != nil {
+			ap, err = i.locValuesReader.readUvarint()
+		} else {
+			ap, err = i.locReader.readUvarint()
+		}
 		if err != nil {
 			return fmt.Errorf("error reading array position: %v", err)
 		}
@@ -516,6 +626,111 @@ func (i *PostingsIterator) readLocation(l *Location) error {
 	}
 
 	return nil
+}
+
+// ReadLocationValuesForMerge reads location values directly for merge optimization.
+// It reads numLocValues values, remaps field IDs using fieldIDRemap, and returns
+// the remapped values. This bypasses Location object creation for faster merge.
+// If fieldIDRemap is nil, no remapping is performed (used when fields are identical).
+// Returns the values and number of values read, or error.
+func (i *PostingsIterator) ReadLocationValuesForMerge(numLocValues int, fieldIDRemap []uint16, buf []uint32) ([]uint32, error) {
+	if i.locReader == nil {
+		return nil, fmt.Errorf("no location reader")
+	}
+
+	// Read all values at once
+	vals, err := i.locReader.readValues32(numLocValues, buf)
+	if err != nil {
+		return nil, err
+	}
+
+	// Skip remapping if fieldIDRemap is nil (fieldsSame case)
+	if fieldIDRemap == nil {
+		return vals, nil
+	}
+
+	// Remap field IDs in place
+	// Location format: [fieldID, pos, start, end, numArrayPos, arrayPos...]
+	idx := 0
+	for idx < len(vals) {
+		if idx >= len(vals) {
+			break
+		}
+		// Remap field ID
+		oldFieldID := vals[idx]
+		if int(oldFieldID) < len(fieldIDRemap) {
+			vals[idx] = uint32(fieldIDRemap[oldFieldID])
+		}
+		idx++ // skip fieldID
+
+		if idx+4 > len(vals) {
+			break
+		}
+		idx += 4 // skip pos, start, end, numArrayPos
+
+		// Skip array positions
+		numAP := int(vals[idx-1])
+		idx += numAP
+	}
+
+	return vals, nil
+}
+
+// NumLocationValues returns the number of location values for the current posting.
+// This is only valid in merge mode after calling Next().
+func (i *PostingsIterator) NumLocationValues() int {
+	return i.numLocValues
+}
+
+// NumFieldIDs returns the number of field IDs for the current posting.
+// This is only valid in merge mode with separated format after calling Next().
+func (i *PostingsIterator) NumFieldIDs() int {
+	return i.numFieldIDs
+}
+
+// HasSeparatedFormat returns true if the source uses separated field IDs format.
+func (i *PostingsIterator) HasSeparatedFormat() bool {
+	return i.locFieldReader != nil
+}
+
+// ReadFieldIDsForMerge reads field IDs directly for merge optimization in separated format.
+// It reads numFieldIDs values, remaps them using fieldIDRemap, and returns the remapped values.
+// If fieldIDRemap is nil, no remapping is performed (used when fieldsSame is true).
+func (i *PostingsIterator) ReadFieldIDsForMerge(numFieldIDs int, fieldIDRemap []uint16, buf []uint32) ([]uint32, error) {
+	if i.locFieldReader == nil {
+		return nil, fmt.Errorf("not using separated format")
+	}
+
+	// Read field IDs at once
+	vals, err := i.locFieldReader.readValues32(numFieldIDs, buf)
+	if err != nil {
+		return nil, err
+	}
+
+	// Skip remapping if fieldIDRemap is nil (fieldsSame case)
+	if fieldIDRemap == nil {
+		return vals, nil
+	}
+
+	// Remap field IDs in place
+	for idx := range vals {
+		oldFieldID := vals[idx]
+		if int(oldFieldID) < len(fieldIDRemap) {
+			vals[idx] = uint32(fieldIDRemap[oldFieldID])
+		}
+	}
+
+	return vals, nil
+}
+
+// ReadValuesForMerge reads location values (pos, start, end, numAP, arraypos...) directly
+// for merge optimization in separated format. These values don't need remapping.
+func (i *PostingsIterator) ReadValuesForMerge(numValues int, buf []uint32) ([]uint32, error) {
+	if i.locValuesReader == nil {
+		return nil, fmt.Errorf("not using separated format")
+	}
+
+	return i.locValuesReader.readValues32(numValues, buf)
 }
 
 // Next returns the next posting on the postings list, or nil at the end
@@ -555,44 +770,103 @@ func (i *PostingsIterator) nextAtOrAfter(atOrAfter uint64) (segment.Posting, err
 	rv.norm = math.Float32frombits(uint32(normBits))
 
 	if i.includeLocs && hasLocs {
-		// prepare locations into reused slices, where we assume
-		// rv.freq >= "number of locs", since in a composite field,
-		// some component fields might have their IncludeTermVector
-		// flags disabled while other component fields are enabled
-		if rv.freq > 0 {
-			if cap(i.nextLocs) >= int(rv.freq) {
-				i.nextLocs = i.nextLocs[0:rv.freq]
+		// Check if using separated format
+		if i.locFieldReader != nil {
+			// Separated format: read from two streams
+			numFieldIDs, err := i.locFieldReader.readUvarint()
+			if err != nil {
+				return nil, fmt.Errorf("error reading location numFieldIDs: %v", err)
+			}
+
+			numValues, err := i.locValuesReader.readUvarint()
+			if err != nil {
+				return nil, fmt.Errorf("error reading location numValues: %v", err)
+			}
+
+			if i.mergeMode {
+				i.numFieldIDs = int(numFieldIDs)
+				i.numLocValues = int(numValues)
+				// Don't parse locations, they'll be read directly by merge code
 			} else {
-				i.nextLocs = make([]Location, rv.freq, rv.freq*2)
+				// Non-merge mode: parse locations using readLocation
+				if rv.freq > 0 {
+					if cap(i.nextLocs) >= int(rv.freq) {
+						i.nextLocs = i.nextLocs[0:rv.freq]
+					} else {
+						i.nextLocs = make([]Location, rv.freq, rv.freq*2)
+					}
+					if cap(i.nextSegmentLocs) < int(rv.freq) {
+						i.nextSegmentLocs = make([]segment.Location, rv.freq, rv.freq*2)
+					}
+					rv.locs = i.nextSegmentLocs[:0]
+				}
+
+				for j := 0; j < int(numFieldIDs); j++ {
+					var nextLoc *Location
+					if len(i.nextLocs) > j {
+						nextLoc = &i.nextLocs[j]
+					} else {
+						nextLoc = &Location{}
+					}
+
+					err := i.readLocation(nextLoc)
+					if err != nil {
+						return nil, err
+					}
+
+					rv.locs = append(rv.locs, nextLoc)
+				}
 			}
-			if cap(i.nextSegmentLocs) < int(rv.freq) {
-				i.nextSegmentLocs = make([]segment.Location, rv.freq, rv.freq*2)
-			}
-			rv.locs = i.nextSegmentLocs[:0]
+
+			return rv, nil
 		}
 
+		// Legacy format: single interleaved stream
 		numLocsBytes, err := i.locReader.readUvarint()
 		if err != nil {
 			return nil, fmt.Errorf("error reading location numLocsBytes: %v", err)
 		}
 
-		j := 0
-		var nextLoc *Location
-		startBytesRemaining := i.locReader.Len() // # bytes remaining in the locReader
-		for startBytesRemaining-i.locReader.Len() < int(numLocsBytes) {
-			if len(i.nextLocs) > j {
-				nextLoc = &i.nextLocs[j]
-			} else {
-				nextLoc = &Location{}
+		// In merge mode, skip Location object creation - just store the value count
+		// for later use with ReadLocationValuesForMerge
+		if i.mergeMode {
+			i.numLocValues = int(numLocsBytes)
+			// Don't parse locations, they'll be read directly by merge code
+		} else {
+			// prepare locations into reused slices, where we assume
+			// rv.freq >= "number of locs", since in a composite field,
+			// some component fields might have their IncludeTermVector
+			// flags disabled while other component fields are enabled
+			if rv.freq > 0 {
+				if cap(i.nextLocs) >= int(rv.freq) {
+					i.nextLocs = i.nextLocs[0:rv.freq]
+				} else {
+					i.nextLocs = make([]Location, rv.freq, rv.freq*2)
+				}
+				if cap(i.nextSegmentLocs) < int(rv.freq) {
+					i.nextSegmentLocs = make([]segment.Location, rv.freq, rv.freq*2)
+				}
+				rv.locs = i.nextSegmentLocs[:0]
 			}
 
-			err := i.readLocation(nextLoc)
-			if err != nil {
-				return nil, err
-			}
+			j := 0
+			var nextLoc *Location
+			startBytesRemaining := i.locReader.Len() // # bytes remaining in the locReader
+			for startBytesRemaining-i.locReader.Len() < int(numLocsBytes) {
+				if len(i.nextLocs) > j {
+					nextLoc = &i.nextLocs[j]
+				} else {
+					nextLoc = &Location{}
+				}
 
-			rv.locs = append(rv.locs, nextLoc)
-			j++
+				err := i.readLocation(nextLoc)
+				if err != nil {
+					return nil, err
+				}
+
+				rv.locs = append(rv.locs, nextLoc)
+				j++
+			}
 		}
 	}
 
@@ -801,13 +1075,31 @@ func (i *PostingsIterator) currChunkNext(nChunk uint32) error {
 	}
 
 	if i.includeLocs && hasLocs {
-		numLocsBytes, err := i.locReader.readUvarint()
-		if err != nil {
-			return fmt.Errorf("error reading location numLocsBytes: %v", err)
-		}
+		if i.locFieldReader != nil {
+			// Separated format: skip both field IDs and values
+			numFieldIDs, err := i.locFieldReader.readUvarint()
+			if err != nil {
+				return fmt.Errorf("error reading location numFieldIDs: %v", err)
+			}
+			for j := uint64(0); j < numFieldIDs; j++ {
+				i.locFieldReader.SkipUvarint()
+			}
 
-		// skip over all the location bytes
-		i.locReader.SkipBytes(int(numLocsBytes))
+			numValues, err := i.locValuesReader.readUvarint()
+			if err != nil {
+				return fmt.Errorf("error reading location numValues: %v", err)
+			}
+			for j := uint64(0); j < numValues; j++ {
+				i.locValuesReader.SkipUvarint()
+			}
+		} else {
+			// Legacy format: skip all location bytes
+			numLocsBytes, err := i.locReader.readUvarint()
+			if err != nil {
+				return fmt.Errorf("error reading location numLocsBytes: %v", err)
+			}
+			i.locReader.SkipBytes(int(numLocsBytes))
+		}
 	}
 
 	return nil

@@ -2,6 +2,8 @@ github.com/RoaringBitmap/roaring/v2 v2.4.5 h1:uGrrMreGjvAtTBobc0g5IrW1D5ldxDQYe2
 github.com/RoaringBitmap/roaring/v2 v2.4.5/go.mod h1:FiJcsfkGje/nZBZgCu0ZxCPOKD/hVXDS2dXi7/eUFE0=
 github.com/ajroetker/go-highway v0.0.0-dev5 h1:IDr6Vf4RPQHtQLj959UiuqPkKcKisf1CZDIOF/4WJ2I=
 github.com/ajroetker/go-highway v0.0.0-dev5/go.mod h1:ZL1hAHj+uU1mZlucNQcQp9gY/hlh1+TDYf4bKuRUj70=
+github.com/ajroetker/go-highway v0.0.0-dev9 h1:GK8IvQKNB1XcuPJ8jBuwD33jVNVgoeV/C5pN9pqHtLw=
+github.com/ajroetker/go-highway v0.0.0-dev9/go.mod h1:oERUP54RxsS+enj+eebC93CCkcn/AWEH4jbFfpVcXDg=
 github.com/bits-and-blooms/bitset v1.12.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/bits-and-blooms/bitset v1.22.0 h1:Tquv9S8+SGaS3EhyA+up3FXzmkhxPGjQQCkcs2uw7w4=
 github.com/bits-and-blooms/bitset v1.22.0/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=

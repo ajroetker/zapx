@@ -278,10 +278,36 @@ func mergeTermFreqNormLocsByCopying(term []byte, postItr *PostingsIterator,
 	return lastDocNum, lastFreq, lastNorm, err
 }
 
+// bufLoc32 is a reusable buffer for batching uint32 location values
+var bufLoc32 []uint32
+
+// fieldIDRemap is a reusable buffer for field ID remapping during merge
+var fieldIDRemap []uint16
+
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
-	tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI, bufLoc []uint64) (
+	tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI, bufLoc []uint64,
+	fieldsSame bool) (
 	lastDocNum uint64, lastFreq uint64, lastNorm uint64, bufLocOut []uint64, err error) {
+
+	// Build field ID remap only if fields differ
+	var remap []uint16
+	if postItr.mergeMode && !fieldsSame {
+		srcFieldsInv := postItr.postings.sb.fieldsInv
+		if cap(fieldIDRemap) < len(srcFieldsInv) {
+			fieldIDRemap = make([]uint16, len(srcFieldsInv))
+		} else {
+			fieldIDRemap = fieldIDRemap[:len(srcFieldsInv)]
+		}
+		for srcFieldID, fieldName := range srcFieldsInv {
+			if dstFieldID, ok := fieldsMap[fieldName]; ok {
+				fieldIDRemap[srcFieldID] = dstFieldID - 1 // destination field ID (0-based)
+			}
+		}
+		remap = fieldIDRemap
+	}
+	// When fieldsSame is true, remap stays nil and no remapping occurs
+
 	next, err := postItr.Next()
 	for next != nil && err == nil {
 		hitNewDocNum := newDocNums[next.Number()]
@@ -299,54 +325,307 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 			return 0, 0, 0, nil, fmt.Errorf("unexpected posting type %T", next)
 		}
 
-		locs := next.Locations()
-
-		if nextFreq > 0 {
-			err = tfEncoder.Add(hitNewDocNum,
-				encodeFreqHasLocs(nextFreq, len(locs) > 0), nextNorm)
+		// In merge mode, use NumLocationValues() instead of Locations()
+		var numLocValues int
+		var hasLocs bool
+		if postItr.mergeMode {
+			numLocValues = postItr.NumLocationValues()
+			hasLocs = numLocValues > 0
 		} else {
-			err = tfEncoder.Add(hitNewDocNum,
-				encodeFreqHasLocs(nextFreq, len(locs) > 0))
-		}
-		if err != nil {
-			return 0, 0, 0, nil, err
-		}
-
-		if len(locs) > 0 {
-			// For StreamVByte, store value count; for varint, store byte count
-			var locSizePrefix int
-			if UseStreamVByte {
-				// Count values: 5 per location + array positions
-				for _, loc := range locs {
-					locSizePrefix += 5 + len(loc.ArrayPositions())
+			locs := next.Locations()
+			hasLocs = len(locs) > 0
+			// Fall through to legacy path below
+			if hasLocs {
+				if nextFreq > 0 {
+					err = tfEncoder.Add(hitNewDocNum,
+						encodeFreqHasLocs(nextFreq, hasLocs), nextNorm)
+				} else {
+					err = tfEncoder.Add(hitNewDocNum,
+						encodeFreqHasLocs(nextFreq, hasLocs))
 				}
-			} else {
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+
 				// Count bytes for varint encoding
+				var locSizePrefix int
 				for _, loc := range locs {
 					ap := loc.ArrayPositions()
 					locSizePrefix += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
 						loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
 				}
-			}
 
-			err = locEncoder.Add(hitNewDocNum, uint64(locSizePrefix))
+				err = locEncoder.Add(hitNewDocNum, uint64(locSizePrefix))
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+
+				for _, loc := range locs {
+					ap := loc.ArrayPositions()
+					if cap(bufLoc) < 5+len(ap) {
+						bufLoc = make([]uint64, 0, 5+len(ap))
+					}
+					args := bufLoc[0:5]
+					args[0] = uint64(fieldsMap[loc.Field()] - 1)
+					args[1] = loc.Pos()
+					args[2] = loc.Start()
+					args[3] = loc.End()
+					args[4] = uint64(len(ap))
+					args = append(args, ap...)
+					err = locEncoder.Add(hitNewDocNum, args...)
+					if err != nil {
+						return 0, 0, 0, nil, err
+					}
+				}
+
+				lastDocNum = hitNewDocNum
+				lastFreq = nextFreq
+				lastNorm = nextNorm
+
+				next, err = postItr.Next()
+				continue
+			}
+		}
+
+		if nextFreq > 0 {
+			err = tfEncoder.Add2(hitNewDocNum,
+				encodeFreqHasLocs(nextFreq, hasLocs), nextNorm)
+		} else {
+			err = tfEncoder.Add1(hitNewDocNum,
+				encodeFreqHasLocs(nextFreq, hasLocs))
+		}
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+
+		if postItr.mergeMode && hasLocs {
+			// Optimized path: read location values directly, remap field IDs
+			err = locEncoder.Add1(hitNewDocNum, uint64(numLocValues))
 			if err != nil {
 				return 0, 0, 0, nil, err
 			}
 
-			for _, loc := range locs {
-				ap := loc.ArrayPositions()
-				if cap(bufLoc) < 5+len(ap) {
-					bufLoc = make([]uint64, 0, 5+len(ap))
+			// Ensure buffer is large enough
+			if cap(bufLoc32) < numLocValues {
+				bufLoc32 = make([]uint32, numLocValues*2)
+			}
+			bufLoc32 = bufLoc32[:numLocValues]
+
+			// Read and remap location values directly
+			// remap is nil when fieldsSame=true, skipping the remapping loop
+			vals, err := postItr.ReadLocationValuesForMerge(numLocValues, remap, bufLoc32)
+			if err != nil {
+				return 0, 0, 0, nil, fmt.Errorf("read location values: %w", err)
+			}
+
+			err = locEncoder.AddValues32(hitNewDocNum, vals)
+			if err != nil {
+				return 0, 0, 0, nil, err
+			}
+		}
+
+		lastDocNum = hitNewDocNum
+		lastFreq = nextFreq
+		lastNorm = nextNorm
+
+		next, err = postItr.Next()
+	}
+
+	return lastDocNum, lastFreq, lastNorm, bufLoc, err
+}
+
+// Buffers for separated format merge
+var bufFieldIDs []uint32
+var bufValues []uint32
+
+// mergeTermFreqNormLocsSeparated merges postings using separated field ID format.
+// Field IDs go to locFieldEncoder, values (pos, start, end, etc.) go to locValuesEncoder.
+// This enables the optimization where values can be copied directly without remapping.
+// When fieldsSame is true, field ID remapping is skipped entirely for faster merge.
+func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
+	newDocNums []uint64, newRoaring *roaring.Bitmap,
+	tfEncoder *chunkedIntCoder, locFieldEncoder, locValuesEncoder chunkedIntCoderI, bufLoc []uint64,
+	fieldsSame bool) (
+	lastDocNum uint64, lastFreq uint64, lastNorm uint64, bufLocOut []uint64, err error) {
+
+	// Build field ID remap only if fields differ
+	var remap []uint16
+	if !fieldsSame {
+		srcFieldsInv := postItr.postings.sb.fieldsInv
+		if cap(fieldIDRemap) < len(srcFieldsInv) {
+			fieldIDRemap = make([]uint16, len(srcFieldsInv))
+		} else {
+			fieldIDRemap = fieldIDRemap[:len(srcFieldsInv)]
+		}
+		for srcFieldID, fieldName := range srcFieldsInv {
+			if dstFieldID, ok := fieldsMap[fieldName]; ok {
+				fieldIDRemap[srcFieldID] = dstFieldID - 1 // destination field ID (0-based)
+			}
+		}
+		remap = fieldIDRemap
+	}
+	// When fieldsSame is true, remap stays nil and no remapping occurs
+
+	next, err := postItr.Next()
+	for next != nil && err == nil {
+		hitNewDocNum := newDocNums[next.Number()]
+		if hitNewDocNum == docDropped {
+			return 0, 0, 0, nil, fmt.Errorf("see hit with dropped docNum")
+		}
+
+		newRoaring.Add(uint32(hitNewDocNum))
+
+		nextFreq := next.Frequency()
+		var nextNorm uint64
+		if pi, ok := next.(*Posting); ok {
+			nextNorm = pi.NormUint64()
+		} else {
+			return 0, 0, 0, nil, fmt.Errorf("unexpected posting type %T", next)
+		}
+
+		// Get location counts
+		numFieldIDs := postItr.NumFieldIDs()
+		numValues := postItr.NumLocationValues()
+		hasLocs := numFieldIDs > 0
+
+		if nextFreq > 0 {
+			err = tfEncoder.Add2(hitNewDocNum,
+				encodeFreqHasLocs(nextFreq, hasLocs), nextNorm)
+		} else {
+			err = tfEncoder.Add1(hitNewDocNum,
+				encodeFreqHasLocs(nextFreq, hasLocs))
+		}
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+
+		if hasLocs {
+			// Check if source uses separated format
+			if postItr.HasSeparatedFormat() {
+				// Separated format source: read field IDs and values separately
+
+				// Add numFieldIDs prefix
+				err = locFieldEncoder.Add(hitNewDocNum, uint64(numFieldIDs))
+				if err != nil {
+					return 0, 0, 0, nil, err
 				}
-				args := bufLoc[0:5]
-				args[0] = uint64(fieldsMap[loc.Field()] - 1)
-				args[1] = loc.Pos()
-				args[2] = loc.Start()
-				args[3] = loc.End()
-				args[4] = uint64(len(ap))
-				args = append(args, ap...)
-				err = locEncoder.Add(hitNewDocNum, args...)
+
+				// Ensure field IDs buffer is large enough
+				if cap(bufFieldIDs) < numFieldIDs {
+					bufFieldIDs = make([]uint32, numFieldIDs*2)
+				}
+				bufFieldIDs = bufFieldIDs[:numFieldIDs]
+
+				// Read and remap field IDs (remap is nil when fieldsSame, skipping remapping)
+				fieldIDs, err := postItr.ReadFieldIDsForMerge(numFieldIDs, remap, bufFieldIDs)
+				if err != nil {
+					return 0, 0, 0, nil, fmt.Errorf("read field IDs: %w", err)
+				}
+
+				err = locFieldEncoder.AddValues32(hitNewDocNum, fieldIDs)
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+
+				// Add numValues prefix
+				err = locValuesEncoder.Add(hitNewDocNum, uint64(numValues))
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+
+				// Ensure values buffer is large enough
+				if cap(bufValues) < numValues {
+					bufValues = make([]uint32, numValues*2)
+				}
+				bufValues = bufValues[:numValues]
+
+				// Read values (no remapping needed)
+				values, err := postItr.ReadValuesForMerge(numValues, bufValues)
+				if err != nil {
+					return 0, 0, 0, nil, fmt.Errorf("read values: %w", err)
+				}
+
+				err = locValuesEncoder.AddValues32(hitNewDocNum, values)
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+			} else {
+				// Legacy format source: need to split field IDs from values
+				// This is the slower path for backward compatibility
+
+				// Ensure buffer is large enough
+				if cap(bufLoc32) < numValues {
+					bufLoc32 = make([]uint32, numValues*2)
+				}
+				bufLoc32 = bufLoc32[:numValues]
+
+				// Read all values (legacy interleaved format)
+				vals, err := postItr.ReadLocationValuesForMerge(numValues, fieldIDRemap, bufLoc32)
+				if err != nil {
+					return 0, 0, 0, nil, fmt.Errorf("read location values: %w", err)
+				}
+
+				// Count locations to determine how many field IDs
+				numLocs := 0
+				idx := 0
+				for idx < len(vals) {
+					numLocs++
+					idx++ // fieldID
+					if idx+4 > len(vals) {
+						break
+					}
+					idx += 4 // pos, start, end, numAP
+					numAP := int(vals[idx-1])
+					idx += numAP
+				}
+
+				// Separate field IDs from values
+				if cap(bufFieldIDs) < numLocs {
+					bufFieldIDs = make([]uint32, numLocs*2)
+				}
+				bufFieldIDs = bufFieldIDs[:numLocs]
+
+				valuesOnly := make([]uint32, 0, numValues-numLocs)
+
+				idx = 0
+				locIdx := 0
+				for idx < len(vals) {
+					// Extract field ID
+					bufFieldIDs[locIdx] = vals[idx]
+					locIdx++
+					idx++ // skip fieldID
+
+					if idx+4 > len(vals) {
+						break
+					}
+
+					// Copy values (pos, start, end, numAP)
+					valuesOnly = append(valuesOnly, vals[idx:idx+4]...)
+					numAP := int(vals[idx+3])
+					idx += 4
+
+					// Copy array positions
+					if numAP > 0 {
+						valuesOnly = append(valuesOnly, vals[idx:idx+numAP]...)
+						idx += numAP
+					}
+				}
+
+				// Write to separated encoders
+				err = locFieldEncoder.Add(hitNewDocNum, uint64(numLocs))
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+				err = locFieldEncoder.AddValues32(hitNewDocNum, bufFieldIDs[:numLocs])
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+
+				err = locValuesEncoder.Add(hitNewDocNum, uint64(len(valuesOnly)))
+				if err != nil {
+					return 0, 0, 0, nil, err
+				}
+				err = locValuesEncoder.AddValues32(hitNewDocNum, valuesOnly)
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -404,6 +683,82 @@ func writePostings(postings *roaring.Bitmap, tfEncoder *chunkedIntCoder, locEnco
 	}
 
 	n = binary.PutUvarint(bufMaxVarintLen64, locOffset)
+	_, err = w.Write(bufMaxVarintLen64[:n])
+	if err != nil {
+		return 0, err
+	}
+
+	_, err = writeRoaringWithLen(postings, w, bufMaxVarintLen64)
+	if err != nil {
+		return 0, err
+	}
+
+	return postingsOffset, nil
+}
+
+// writePostingsSeparated writes postings with separated field IDs format.
+// This allows field IDs and values to be stored in separate streams for faster merge.
+func writePostingsSeparated(postings *roaring.Bitmap, tfEncoder *chunkedIntCoder,
+	locFieldEncoder, locValuesEncoder chunkedIntCoderI,
+	use1HitEncoding func(uint64) (bool, uint64, uint64),
+	w *CountHashWriter, bufMaxVarintLen64 []byte) (
+	offset uint64, err error) {
+	if postings == nil {
+		return 0, nil
+	}
+
+	termCardinality := postings.GetCardinality()
+	if termCardinality <= 0 {
+		return 0, nil
+	}
+
+	if use1HitEncoding != nil {
+		encodeAs1Hit, docNum1Hit, normBits1Hit := use1HitEncoding(termCardinality)
+		if encodeAs1Hit {
+			return FSTValEncode1Hit(docNum1Hit, normBits1Hit), nil
+		}
+	}
+
+	var tfOffset uint64
+	tfOffset, _, err = tfEncoder.writeAt(w)
+	if err != nil {
+		return 0, err
+	}
+
+	var locFieldOffset uint64
+	locFieldOffset, _, err = locFieldEncoder.writeAt(w)
+	if err != nil {
+		return 0, err
+	}
+
+	var locValuesOffset uint64
+	locValuesOffset, _, err = locValuesEncoder.writeAt(w)
+	if err != nil {
+		return 0, err
+	}
+
+	postingsOffset := uint64(w.Count())
+
+	// Write tfOffset
+	n := binary.PutUvarint(bufMaxVarintLen64, tfOffset)
+	_, err = w.Write(bufMaxVarintLen64[:n])
+	if err != nil {
+		return 0, err
+	}
+
+	// Write separated format marker (2-byte: 0xFF 0x00) followed by the two location offsets
+	_, err = w.Write(SeparatedLocFormatMarker)
+	if err != nil {
+		return 0, err
+	}
+
+	n = binary.PutUvarint(bufMaxVarintLen64, locFieldOffset)
+	_, err = w.Write(bufMaxVarintLen64[:n])
+	if err != nil {
+		return 0, err
+	}
+
+	n = binary.PutUvarint(bufMaxVarintLen64, locValuesOffset)
 	_, err = w.Write(bufMaxVarintLen64[:n])
 	if err != nil {
 		return 0, err

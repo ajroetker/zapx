@@ -30,7 +30,9 @@ const termNotEncoded = 0
 // Both chunkedIntCoder (legacy varint) and streamVByteChunkedIntCoder implement this.
 type chunkedIntCoderI interface {
 	Add(docNum uint64, vals ...uint64) error
+	Add1(docNum uint64, val uint64) error           // non-variadic single-value add (avoids slice allocation)
 	AddBytes(docNum uint64, buf []byte) error
+	AddValues32(docNum uint64, vals []uint32) error // batch add for faster merge
 	Close()
 	Reset()
 	SetChunkSize(chunkSize uint64, maxDocNum uint64)
@@ -45,6 +47,7 @@ type chunkedIntCoderI interface {
 type chunkedIntDecoderI interface {
 	loadChunk(chunk int) error
 	readUvarint() (uint64, error)
+	readValues32(n int, buf []uint32) ([]uint32, error) // batch read for faster merge
 	reset()
 	isNil() bool
 	getBytesRead() uint64
@@ -154,6 +157,43 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 	return nil
 }
 
+// Add1 encodes a single integer into the correct chunk (non-variadic to avoid slice allocation).
+func (c *chunkedIntCoder) Add1(docNum uint64, val uint64) error {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		c.Close()
+		c.chunkBuf.Reset()
+		c.currChunk = chunk
+	}
+
+	if len(c.buf) < binary.MaxVarintLen64 {
+		c.buf = make([]byte, binary.MaxVarintLen64)
+	}
+
+	wb := binary.PutUvarint(c.buf, val)
+	_, err := c.chunkBuf.Write(c.buf[:wb])
+	return err
+}
+
+// Add2 encodes two integers into the correct chunk (non-variadic to avoid slice allocation).
+func (c *chunkedIntCoder) Add2(docNum uint64, val1, val2 uint64) error {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		c.Close()
+		c.chunkBuf.Reset()
+		c.currChunk = chunk
+	}
+
+	if len(c.buf) < binary.MaxVarintLen64*2 {
+		c.buf = make([]byte, binary.MaxVarintLen64*2)
+	}
+
+	wb := binary.PutUvarint(c.buf, val1)
+	wb += binary.PutUvarint(c.buf[wb:], val2)
+	_, err := c.chunkBuf.Write(c.buf[:wb])
+	return err
+}
+
 func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 	chunk := docNum / c.chunkSize
 	if chunk != c.currChunk {
@@ -165,6 +205,30 @@ func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 
 	_, err := c.chunkBuf.Write(buf)
 	return err
+}
+
+// AddValues32 adds uint32 values (converts to uint64 for varint encoding)
+func (c *chunkedIntCoder) AddValues32(docNum uint64, vals []uint32) error {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		c.Close()
+		c.chunkBuf.Reset()
+		c.currChunk = chunk
+	}
+
+	if len(c.buf) < binary.MaxVarintLen64 {
+		c.buf = make([]byte, binary.MaxVarintLen64)
+	}
+
+	for _, val := range vals {
+		wb := binary.PutUvarint(c.buf, uint64(val))
+		_, err := c.chunkBuf.Write(c.buf[:wb])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Close indicates you are done calling Add() this allows the final chunk

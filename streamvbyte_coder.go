@@ -27,6 +27,13 @@ import (
 // for location data. Set to false to disable StreamVByte encoding.
 var UseStreamVByte = true
 
+// UseSeparatedFieldIDs controls whether location data stores field IDs
+// in a separate stream from values. When false (default), single-stream format
+// is used which has fewer allocations and better merge performance.
+// When true, field IDs and values are stored in separate streams.
+// Only effective when UseStreamVByte is true.
+var UseSeparatedFieldIDs = false
+
 // StreamVByte chunk format:
 //   [format byte] [numValues varint] [controlLen varint] [control bytes] [data bytes]
 //
@@ -35,6 +42,14 @@ const (
 	ChunkFormatVarint      = 0x00 // Legacy varint encoding
 	ChunkFormatStreamVByte = 0x01 // StreamVByte encoding
 )
+
+// SeparatedLocFormatMarker is a 2-byte marker indicating separated field ID encoding.
+// The sequence 0xFF 0x00 can't be a valid varint because:
+// - 0xFF means continuation (value=127, more bytes follow)
+// - 0x00 means value=0 with no continuation
+// - Total would be 127, but that should be encoded as single byte 0x7F
+// So 0xFF 0x00 is invalid varint, making it a safe marker.
+var SeparatedLocFormatMarker = []byte{0xFF, 0x00}
 
 // streamVByteChunkedIntCoder encodes integers using StreamVByte within chunks.
 // This is a drop-in replacement for chunkedIntCoder when UseStreamVByte is true.
@@ -50,17 +65,28 @@ type streamVByteChunkedIntCoder struct {
 
 	buf []byte
 
+	// Reusable buffers for encoding to reduce allocations
+	numBuf     []byte // buffer for varint encoding
+	controlBuf []byte // buffer for StreamVByte control bytes
+	dataBuf    []byte // buffer for StreamVByte data bytes
+
 	bytesWritten uint64
 }
 
 // newStreamVByteChunkedIntCoder returns a new StreamVByte chunk int coder
 func newStreamVByteChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *streamVByteChunkedIntCoder {
 	total := maxDocNum/chunkSize + 1
+	// Estimate final size: ~8 bytes per value (generous to avoid reallocation)
+	// This is larger than needed but reduces memory management overhead
+	estimatedFinalSize := int(total) * 512 * 8
 	return &streamVByteChunkedIntCoder{
 		chunkSize:   chunkSize,
 		chunkLens:   make([]uint64, total),
-		final:       make([]byte, 0, 64),
-		chunkValues: make([]uint32, 0, 256),
+		final:       make([]byte, 0, estimatedFinalSize),
+		chunkValues: make([]uint32, 0, 512),              // larger initial capacity
+		numBuf:      make([]byte, binary.MaxVarintLen64*2),
+		controlBuf:  make([]byte, 0, 128),  // larger for bigger chunks
+		dataBuf:     make([]byte, 0, 2048), // larger for bigger chunks
 	}
 }
 
@@ -113,6 +139,33 @@ func (c *streamVByteChunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 	return nil
 }
 
+// Add1 encodes a single integer into the correct chunk (non-variadic to avoid slice allocation).
+func (c *streamVByteChunkedIntCoder) Add1(docNum uint64, val uint64) error {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		c.Close()
+		c.chunkValues = c.chunkValues[:0]
+		c.currChunk = chunk
+	}
+
+	c.chunkValues = append(c.chunkValues, uint32(val))
+	return nil
+}
+
+// AddValues32 appends uint32 values directly without conversion.
+// This is faster than Add() when values are already uint32.
+func (c *streamVByteChunkedIntCoder) AddValues32(docNum uint64, vals []uint32) error {
+	chunk := docNum / c.chunkSize
+	if chunk != c.currChunk {
+		c.Close()
+		c.chunkValues = c.chunkValues[:0]
+		c.currChunk = chunk
+	}
+
+	c.chunkValues = append(c.chunkValues, vals...)
+	return nil
+}
+
 // AddBytes adds raw bytes to the current chunk (not StreamVByte encoded)
 func (c *streamVByteChunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 	chunk := docNum / c.chunkSize
@@ -146,32 +199,35 @@ func (c *streamVByteChunkedIntCoder) Close() {
 		return
 	}
 
-	// Encode values using StreamVByte
-	control, data := varint.EncodeStreamVByte32(c.chunkValues)
+	// Encode values using StreamVByte (reuse buffers to avoid allocations)
+	control, data := varint.EncodeStreamVByte32Into(c.chunkValues, c.controlBuf, c.dataBuf)
+	c.controlBuf = control // update buffer reference in case it was grown
+	c.dataBuf = data
 
-	// Build chunk: [format] [numValues] [controlLen] [control] [data]
-	var buf bytes.Buffer
+	// Build chunk directly in final: [format] [numValues] [controlLen] [control] [data]
+	// Calculate header sizes
+	n1 := binary.PutUvarint(c.numBuf, uint64(len(c.chunkValues)))
+	n2 := binary.PutUvarint(c.numBuf[n1:], uint64(len(control)))
 
-	// Format byte
-	buf.WriteByte(ChunkFormatStreamVByte)
+	// Total chunk size: 1 (format) + n1 (numValues) + n2 (controlLen) + control + data
+	chunkSize := 1 + n1 + n2 + len(control) + len(data)
 
-	// Number of values
-	numBuf := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutUvarint(numBuf, uint64(len(c.chunkValues)))
-	buf.Write(numBuf[:n])
+	// Pre-grow final to avoid multiple reallocations
+	startLen := len(c.final)
+	if cap(c.final) < startLen+chunkSize {
+		newFinal := make([]byte, startLen, startLen+chunkSize+1024)
+		copy(newFinal, c.final)
+		c.final = newFinal
+	}
 
-	// Control length
-	n = binary.PutUvarint(numBuf, uint64(len(control)))
-	buf.Write(numBuf[:n])
+	// Write directly to final
+	c.final = append(c.final, ChunkFormatStreamVByte)
+	c.final = append(c.final, c.numBuf[:n1+n2]...)
+	c.final = append(c.final, control...)
+	c.final = append(c.final, data...)
 
-	// Control and data bytes
-	buf.Write(control)
-	buf.Write(data)
-
-	encodingBytes := buf.Bytes()
-	c.incrementBytesWritten(uint64(len(encodingBytes)))
-	c.chunkLens[c.currChunk] = uint64(len(encodingBytes))
-	c.final = append(c.final, encodingBytes...)
+	c.incrementBytesWritten(uint64(chunkSize))
+	c.chunkLens[c.currChunk] = uint64(chunkSize)
 	c.chunkBuf.Reset()
 	c.currChunk = uint64(cap(c.chunkLens))
 }
@@ -396,6 +452,34 @@ func (d *streamVByteChunkedIntDecoder) readUvarint() (uint64, error) {
 		return 0, io.EOF
 	}
 	return d.r.ReadUvarint()
+}
+
+// readValues32 reads n values and returns them as a uint32 slice.
+// For StreamVByte, this returns a slice of the internal decoded buffer (no copy).
+// For varint, this decodes values into the provided buffer.
+func (d *streamVByteChunkedIntDecoder) readValues32(n int, buf []uint32) ([]uint32, error) {
+	if d.format == ChunkFormatStreamVByte {
+		if d.pos+n > len(d.values) {
+			return nil, io.EOF
+		}
+		result := d.values[d.pos : d.pos+n]
+		d.pos += n
+		return result, nil
+	}
+	// Fallback: decode into buffer
+	if cap(buf) < n {
+		buf = make([]uint32, n)
+	} else {
+		buf = buf[:n]
+	}
+	for i := 0; i < n; i++ {
+		val, err := d.r.ReadUvarint()
+		if err != nil {
+			return nil, err
+		}
+		buf[i] = uint32(val)
+	}
+	return buf, nil
 }
 
 func (d *streamVByteChunkedIntDecoder) readBytes(start, end int) []byte {

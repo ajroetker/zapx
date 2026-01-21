@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.4.5
-	github.com/ajroetker/go-highway v0.0.0-dev5
+	github.com/ajroetker/go-highway v0.0.0-dev9
 	github.com/blevesearch/bleve_index_api v1.3.0
 	github.com/blevesearch/go-faiss v1.0.27
 	github.com/blevesearch/mmap-go v1.0.4

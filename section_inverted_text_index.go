@@ -97,7 +97,18 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(1024, newSegDocCount-1)
-	locEncoder := newLocEncoder(1024, newSegDocCount-1)
+
+	// Location encoders - either single (legacy) or separated (field IDs + values)
+	var locEncoder chunkedIntCoderI       // legacy single stream
+	var locFieldEncoder chunkedIntCoderI  // separated: field IDs only
+	var locValuesEncoder chunkedIntCoderI // separated: values only
+	useSeparated := UseStreamVByte && UseSeparatedFieldIDs
+	if useSeparated {
+		locFieldEncoder = newLocEncoder(1024, newSegDocCount-1)
+		locValuesEncoder = newLocEncoder(1024, newSegDocCount-1)
+	} else {
+		locEncoder = newLocEncoder(1024, newSegDocCount-1)
+	}
 
 	var vellumBuf bytes.Buffer
 	newVellum, err := vellum.New(&vellumBuf, nil)
@@ -162,7 +173,13 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 		// when a term appears in only 1 doc, with no loc info,
 		// has freq of 1, and the docNum fits into 31-bits
 		use1HitEncoding := func(termCardinality uint64) (bool, uint64, uint64) {
-			if termCardinality == uint64(1) && locEncoder.FinalSize() <= 0 {
+			var locSize int
+			if useSeparated {
+				locSize = locFieldEncoder.FinalSize() + locValuesEncoder.FinalSize()
+			} else {
+				locSize = locEncoder.FinalSize()
+			}
+			if termCardinality == uint64(1) && locSize <= 0 {
 				docNum := uint64(newRoaring.Minimum())
 				if under32Bits(docNum) && docNum == lastDocNum && lastFreq == 1 {
 					return true, docNum, lastNorm
@@ -173,10 +190,23 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 
 		finishTerm := func(term []byte) error {
 			tfEncoder.Close()
-			locEncoder.Close()
 
-			postingsOffset, err := writePostings(newRoaring,
-				tfEncoder, locEncoder, use1HitEncoding, w, bufMaxVarintLen64)
+			var postingsOffset uint64
+			var err error
+
+			if useSeparated {
+				locFieldEncoder.Close()
+				locValuesEncoder.Close()
+
+				postingsOffset, err = writePostingsSeparated(newRoaring,
+					tfEncoder, locFieldEncoder, locValuesEncoder,
+					use1HitEncoding, w, bufMaxVarintLen64)
+			} else {
+				locEncoder.Close()
+
+				postingsOffset, err = writePostings(newRoaring,
+					tfEncoder, locEncoder, use1HitEncoding, w, bufMaxVarintLen64)
+			}
 			if err != nil {
 				return err
 			}
@@ -191,7 +221,12 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 			newRoaring.Clear()
 
 			tfEncoder.Reset()
-			locEncoder.Reset()
+			if useSeparated {
+				locFieldEncoder.Reset()
+				locValuesEncoder.Reset()
+			} else {
+				locEncoder.Reset()
+			}
 
 			lastDocNum = 0
 			lastFreq = 0
@@ -236,7 +271,12 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 				}
 				// update encoders chunk
 				tfEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
-				locEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+				if useSeparated {
+					locFieldEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+					locValuesEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+				} else {
+					locEncoder.SetChunkSize(chunkSize, newSegDocCount-1)
+				}
 			}
 
 			postings, err = dicts[itrI].postingsListFromOffset(
@@ -245,7 +285,8 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 				return nil, err
 			}
 
-			postItr = postings.iterator(true, true, true, postItr)
+			// Use merge-optimized iterator when StreamVByte is enabled
+			postItr = postings.iteratorForMerge(postItr)
 
 			// can only safely copy data if all segments have same fields
 			// and not using StreamVByte (StreamVByte decodes all values upfront,
@@ -255,10 +296,16 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 				lastDocNum, lastFreq, lastNorm, err = mergeTermFreqNormLocsByCopying(
 					term, postItr, newDocNums[itrI], newRoaring,
 					tfEncoder, locEncoder)
+			} else if useSeparated {
+				// Separated field IDs format: field IDs and values in separate streams
+				// Pass fieldsSame to skip remapping when fields are identical
+				lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocsSeparated(
+					fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
+					tfEncoder, locFieldEncoder, locValuesEncoder, bufLoc, fieldsSame)
 			} else {
 				lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
 					fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
-					tfEncoder, locEncoder, bufLoc)
+					tfEncoder, locEncoder, bufLoc, fieldsSame)
 			}
 			if err != nil {
 				return nil, err
@@ -453,7 +500,18 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 	// however this will be reset to the correct chunk size
 	// while processing each individual field-term section
 	tfEncoder := newChunkedIntCoder(1024, uint64(len(io.results)-1))
-	locEncoder := newLocEncoder(1024, uint64(len(io.results)-1))
+
+	// Location encoders - either single (legacy) or separated (field IDs + values)
+	var locEncoder chunkedIntCoderI       // legacy single stream
+	var locFieldEncoder chunkedIntCoderI  // separated: field IDs only
+	var locValuesEncoder chunkedIntCoderI // separated: values only
+	useSeparatedIndex := UseStreamVByte && UseSeparatedFieldIDs
+	if useSeparatedIndex {
+		locFieldEncoder = newLocEncoder(1024, uint64(len(io.results)-1))
+		locValuesEncoder = newLocEncoder(1024, uint64(len(io.results)-1))
+	} else {
+		locEncoder = newLocEncoder(1024, uint64(len(io.results)-1))
+	}
 
 	var docTermMap [][]byte
 
@@ -496,7 +554,12 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				return err
 			}
 			tfEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
-			locEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
+			if useSeparatedIndex {
+				locFieldEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
+				locValuesEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
+			} else {
+				locEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
+			}
 
 			postingsItr := postingsBS.Iterator()
 			for postingsItr.HasNext() {
@@ -519,40 +582,85 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				}
 
 				if freqNorm.numLocs > 0 {
-					// For StreamVByte, store value count; for varint, store byte count
-					var locSizePrefix int
-					if UseStreamVByte {
-						// Count values: 5 per location + array positions
-						for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-							locSizePrefix += 5 + len(loc.arrayposs)
+					if useSeparatedIndex {
+						// Separated format: field IDs and values in separate streams
+						numLocs := freqNorm.numLocs
+
+						// Write number of locations to both streams as prefix
+						err = locFieldEncoder.Add(docNum, uint64(numLocs))
+						if err != nil {
+							return err
 						}
+
+						// Count values for the values stream (4 per loc + array positions)
+						var valuesCount int
+						for _, loc := range locs[locOffset : locOffset+numLocs] {
+							valuesCount += 4 + len(loc.arrayposs) // pos, start, end, numAP, ap...
+						}
+						err = locValuesEncoder.Add(docNum, uint64(valuesCount))
+						if err != nil {
+							return err
+						}
+
+						// Write field IDs to field stream
+						for _, loc := range locs[locOffset : locOffset+numLocs] {
+							err = locFieldEncoder.Add(docNum, uint64(loc.fieldID))
+							if err != nil {
+								return err
+							}
+						}
+
+						// Write values to values stream
+						for _, loc := range locs[locOffset : locOffset+numLocs] {
+							err = locValuesEncoder.Add(docNum,
+								loc.pos, loc.start, loc.end,
+								uint64(len(loc.arrayposs)))
+							if err != nil {
+								return err
+							}
+							err = locValuesEncoder.Add(docNum, loc.arrayposs...)
+							if err != nil {
+								return err
+							}
+						}
+						locOffset += numLocs
 					} else {
-						// Count bytes for varint encoding
+						// Legacy format: interleaved field IDs and values
+						// For StreamVByte, store value count; for varint, store byte count
+						var locSizePrefix int
+						if UseStreamVByte {
+							// Count values: 5 per location + array positions
+							for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
+								locSizePrefix += 5 + len(loc.arrayposs)
+							}
+						} else {
+							// Count bytes for varint encoding
+							for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
+								locSizePrefix += totalUvarintBytes(
+									uint64(loc.fieldID), loc.pos, loc.start, loc.end,
+									uint64(len(loc.arrayposs)), loc.arrayposs)
+							}
+						}
+
+						err = locEncoder.Add(docNum, uint64(locSizePrefix))
+						if err != nil {
+							return err
+						}
 						for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-							locSizePrefix += totalUvarintBytes(
+							err = locEncoder.Add(docNum,
 								uint64(loc.fieldID), loc.pos, loc.start, loc.end,
-								uint64(len(loc.arrayposs)), loc.arrayposs)
-						}
-					}
+								uint64(len(loc.arrayposs)))
+							if err != nil {
+								return err
+							}
 
-					err = locEncoder.Add(docNum, uint64(locSizePrefix))
-					if err != nil {
-						return err
-					}
-					for _, loc := range locs[locOffset : locOffset+freqNorm.numLocs] {
-						err = locEncoder.Add(docNum,
-							uint64(loc.fieldID), loc.pos, loc.start, loc.end,
-							uint64(len(loc.arrayposs)))
-						if err != nil {
-							return err
+							err = locEncoder.Add(docNum, loc.arrayposs...)
+							if err != nil {
+								return err
+							}
 						}
-
-						err = locEncoder.Add(docNum, loc.arrayposs...)
-						if err != nil {
-							return err
-						}
+						locOffset += freqNorm.numLocs
 					}
-					locOffset += freqNorm.numLocs
 				}
 
 				freqNormOffset++
@@ -563,12 +671,24 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 			}
 
 			tfEncoder.Close()
-			locEncoder.Close()
-			io.incrementBytesWritten(locEncoder.getBytesWritten())
+			if useSeparatedIndex {
+				locFieldEncoder.Close()
+				locValuesEncoder.Close()
+				io.incrementBytesWritten(locFieldEncoder.getBytesWritten())
+				io.incrementBytesWritten(locValuesEncoder.getBytesWritten())
+			} else {
+				locEncoder.Close()
+				io.incrementBytesWritten(locEncoder.getBytesWritten())
+			}
 			io.incrementBytesWritten(tfEncoder.getBytesWritten())
 
-			postingsOffset, err :=
-				writePostings(postingsBS, tfEncoder, locEncoder, nil, w, buf)
+			var postingsOffset uint64
+			if useSeparatedIndex {
+				postingsOffset, err = writePostingsSeparated(postingsBS, tfEncoder,
+					locFieldEncoder, locValuesEncoder, nil, w, buf)
+			} else {
+				postingsOffset, err = writePostings(postingsBS, tfEncoder, locEncoder, nil, w, buf)
+			}
 			if err != nil {
 				return err
 			}
@@ -581,7 +701,12 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 			}
 
 			tfEncoder.Reset()
-			locEncoder.Reset()
+			if useSeparatedIndex {
+				locFieldEncoder.Reset()
+				locValuesEncoder.Reset()
+			} else {
+				locEncoder.Reset()
+			}
 		}
 
 		err = io.builder.Close()
