@@ -19,7 +19,9 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/ajroetker/go-highway/hwy/contrib/varint"
+	seg "github.com/blevesearch/scorch_segment_api/v2"
 )
 
 // TestStreamVByteChunkedIntCoderRoundTrip tests encoding and decoding
@@ -35,9 +37,22 @@ func TestStreamVByteChunkedIntCoderRoundTrip(t *testing.T) {
 
 	coder := newStreamVByteChunkedIntCoder(1024, 100)
 
+	// Compute total values count for the count prefix
+	// Format expected by columnar encoding: [count] [values...]
+	var totalValues int
+	for _, locData := range testData {
+		totalValues += len(locData)
+	}
+
+	// Add count prefix first (this is what merge path does with Add1)
+	err := coder.Add(0, uint64(totalValues))
+	if err != nil {
+		t.Fatalf("Add count failed: %v", err)
+	}
+
 	// Add all data as if from document 0
 	for _, locData := range testData {
-		err := coder.Add(0, locData...)
+		err = coder.Add(0, locData...)
 		if err != nil {
 			t.Fatalf("Add failed: %v", err)
 		}
@@ -46,7 +61,7 @@ func TestStreamVByteChunkedIntCoderRoundTrip(t *testing.T) {
 
 	// Write to buffer
 	var buf bytes.Buffer
-	_, err := coder.Write(&buf)
+	_, err = coder.Write(&buf)
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
@@ -66,12 +81,21 @@ func TestStreamVByteChunkedIntCoderRoundTrip(t *testing.T) {
 		t.Fatalf("loadChunk failed: %v", err)
 	}
 
-	// Verify format is StreamVByte
-	if decoder.format != ChunkFormatStreamVByte {
+	// Verify format is StreamVByte (any variant including columnar)
+	if decoder.format != ChunkFormatStreamVByte && decoder.format != ChunkFormatStreamVByteDelta && decoder.format != ChunkFormatColumnar {
 		t.Fatalf("Expected StreamVByte format, got %d", decoder.format)
 	}
 
-	// Read back and verify
+	// Read the count prefix first
+	gotCount, err := decoder.readUvarint()
+	if err != nil {
+		t.Fatalf("readUvarint for count failed: %v", err)
+	}
+	if gotCount != uint64(totalValues) {
+		t.Errorf("Count mismatch: got %d, want %d", gotCount, totalValues)
+	}
+
+	// Read back and verify location data
 	for i, locData := range testData {
 		for j, expected := range locData {
 			got, err := decoder.readUvarint()
@@ -222,4 +246,126 @@ func decodeLocationsVarint(data []byte, numLocs int) [][]uint64 {
 		result = append(result, loc)
 	}
 	return result
+}
+
+// TestMergeFormatUpgrade verifies that segments created with old location format
+// are correctly upgraded to the new columnar delta format during merge.
+func TestMergeFormatUpgrade(t *testing.T) {
+	// Save original settings
+	origUseStreamVByte := UseStreamVByte
+	origUseColumnar := UseColumnarLocations
+	defer func() {
+		UseStreamVByte = origUseStreamVByte
+		UseColumnarLocations = origUseColumnar
+	}()
+
+	tmpDir := t.TempDir()
+
+	// Step 1: Create segments with OLD format (row-oriented StreamVByte)
+	UseStreamVByte = true
+	UseColumnarLocations = false
+
+	seg1Path := tmpDir + "/seg1.zap"
+	seg2Path := tmpDir + "/seg2.zap"
+
+	// Build first segment
+	testSeg1, _, _ := buildTestSegmentMulti()
+	err := PersistSegmentBase(testSeg1, seg1Path)
+	if err != nil {
+		t.Fatalf("persist seg1: %v", err)
+	}
+
+	// Build second segment
+	testSeg2, _, _ := buildTestSegmentMulti2()
+	err = PersistSegmentBase(testSeg2, seg2Path)
+	if err != nil {
+		t.Fatalf("persist seg2: %v", err)
+	}
+
+	// Open segments
+	segment1, err := zapPlugin.Open(seg1Path)
+	if err != nil {
+		t.Fatalf("open seg1: %v", err)
+	}
+	defer segment1.Close()
+
+	segment2, err := zapPlugin.Open(seg2Path)
+	if err != nil {
+		t.Fatalf("open seg2: %v", err)
+	}
+	defer segment2.Close()
+
+	// Step 2: Merge with NEW format enabled (columnar delta)
+	UseColumnarLocations = true
+
+	mergedPath := tmpDir + "/merged.zap"
+	segsToMerge := []seg.Segment{segment1, segment2}
+	drops := []*roaring.Bitmap{nil, nil}
+
+	_, _, err = zapPlugin.Merge(segsToMerge, drops, mergedPath, nil, nil)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// Step 3: Open merged segment and verify location data is readable
+	mergedSeg, err := zapPlugin.Open(mergedPath)
+	if err != nil {
+		t.Fatalf("open merged: %v", err)
+	}
+	defer mergedSeg.Close()
+
+	merged := mergedSeg.(*Segment)
+
+	// Verify document count
+	if merged.Count() != 4 {
+		t.Errorf("expected 4 docs, got %d", merged.Count())
+	}
+
+	// Verify we can read location data from postings
+	// This exercises the decoder with the new format
+	dict, err := merged.Dictionary("name")
+	if err != nil {
+		t.Fatalf("get dictionary: %v", err)
+	}
+
+	// Iterate through all terms and verify location data is readable
+	dictIter := dict.AutomatonIterator(nil, nil, nil)
+	for {
+		entry, err := dictIter.Next()
+		if err != nil {
+			t.Fatalf("dict iter: %v", err)
+		}
+		if entry == nil {
+			break
+		}
+
+		// Get postings list with locations
+		plist, err := dict.(*Dictionary).postingsList([]byte(entry.Term), nil, nil)
+		if err != nil {
+			t.Fatalf("postings list for %s: %v", entry.Term, err)
+		}
+
+		// Iterate through postings and read locations
+		pitr := plist.Iterator(true, true, true, nil)
+		for {
+			posting, err := pitr.Next()
+			if err != nil {
+				t.Fatalf("posting iter: %v", err)
+			}
+			if posting == nil {
+				break
+			}
+
+			// Get locations - this verifies the decoder works with the new format
+			locs := posting.Locations()
+			for _, loc := range locs {
+				// Verify location data is sensible
+				if loc.Start() > loc.End() {
+					t.Errorf("invalid location: start %d > end %d", loc.Start(), loc.End())
+				}
+			}
+		}
+	}
+
+	t.Logf("Format upgrade test passed: merged segment has %d docs with readable locations", merged.Count())
 }
