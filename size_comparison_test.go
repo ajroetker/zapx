@@ -9,6 +9,9 @@ import (
 )
 
 func TestEncodedSizeComparison(t *testing.T) {
+	origUseColumnar := UseColumnarLocations
+	defer func() { UseColumnarLocations = origUseColumnar }()
+
 	// Generate data similar to what merge produces
 	// Multiple documents with varying location counts
 	var allValues []uint32
@@ -62,7 +65,4 @@ func TestEncodedSizeComparison(t *testing.T) {
 	var colBuf bytes.Buffer
 	coder2.Write(&colBuf)
 	t.Logf("StreamVByte (columnar) encoded size: %d bytes", colBuf.Len())
-
-	// Reset to default
-	UseColumnarLocations = true
 }

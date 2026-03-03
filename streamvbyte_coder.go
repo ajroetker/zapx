@@ -91,10 +91,11 @@ type streamVByteChunkedIntCoder struct {
 	buf []byte
 
 	// Reusable buffers for encoding to reduce allocations
-	numBuf     []byte   // buffer for varint encoding
-	controlBuf []byte   // buffer for StreamVByte control bytes
-	dataBuf    []byte   // buffer for StreamVByte data bytes
-	deltaBuf   []uint32 // buffer for delta encoding
+	numBuf      []byte   // buffer for varint encoding (header + column lengths)
+	controlBuf  []byte   // buffer for StreamVByte control bytes
+	dataBuf     []byte   // buffer for StreamVByte data bytes
+	deltaBuf    []uint32 // buffer for delta encoding (start deltas)
+	endDeltaBuf []uint32 // buffer for delta encoding (end deltas)
 
 	// Columnar encoding buffers (for UseColumnarLocations)
 	colCounts    []uint32 // document value counts
@@ -113,16 +114,17 @@ func newStreamVByteChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *streamVB
 	total := maxDocNum/chunkSize + 1
 	// Estimate final size: ~8 bytes per value (generous to avoid reallocation)
 	// This is larger than needed but reduces memory management overhead
-	estimatedFinalSize := int(total) * 512 * 8
+	estimatedFinalSize := int(total) * 256
 	return &streamVByteChunkedIntCoder{
 		chunkSize:    chunkSize,
 		chunkLens:    make([]uint64, total),
 		final:        make([]byte, 0, estimatedFinalSize),
 		chunkValues:  make([]uint32, 0, 512), // larger initial capacity
-		numBuf:       make([]byte, binary.MaxVarintLen64*2),
-		controlBuf:   make([]byte, 0, 128),  // larger for bigger chunks
-		dataBuf:      make([]byte, 0, 2048), // larger for bigger chunks
-		deltaBuf:     make([]uint32, 0, 512),
+		numBuf:      make([]byte, binary.MaxVarintLen64*3),
+		controlBuf:  make([]byte, 0, 128),  // larger for bigger chunks
+		dataBuf:     make([]byte, 0, 2048), // larger for bigger chunks
+		deltaBuf:    make([]uint32, 0, 512),
+		endDeltaBuf: make([]uint32, 0, 512),
 		colCounts:    make([]uint32, 0, 32),
 		colFieldIDs:  make([]uint32, 0, 128),
 		colPositions: make([]uint32, 0, 128),
@@ -377,7 +379,10 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 	}
 
 	// Delta encode ends (monotonically increasing byte offsets)
-	endDeltas := make([]uint32, numLocs)
+	if cap(c.endDeltaBuf) < numLocs {
+		c.endDeltaBuf = make([]uint32, numLocs)
+	}
+	endDeltas := c.endDeltaBuf[:numLocs]
 	if numLocs > 0 {
 		endDeltas[0] = c.colEnds[0]
 		for i := 1; i < numLocs; i++ {
@@ -393,11 +398,10 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 	c.chunkBuf.WriteByte(ChunkFormatColumnar)
 
 	// Write header: numDocs, numLocs, numArrayPos
-	headerBuf := make([]byte, binary.MaxVarintLen64*3)
-	n := binary.PutUvarint(headerBuf, uint64(numDocs))
-	n += binary.PutUvarint(headerBuf[n:], uint64(numLocs))
-	n += binary.PutUvarint(headerBuf[n:], uint64(numArrayPos))
-	c.chunkBuf.Write(headerBuf[:n])
+	n := binary.PutUvarint(c.numBuf, uint64(numDocs))
+	n += binary.PutUvarint(c.numBuf[n:], uint64(numLocs))
+	n += binary.PutUvarint(c.numBuf[n:], uint64(numArrayPos))
+	c.chunkBuf.Write(c.numBuf[:n])
 
 	// Helper to encode and write a column
 	writeColumn := func(values []uint32) {
@@ -411,9 +415,8 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 		c.dataBuf = data
 
 		// Write controlLen + control + data
-		lenBuf := make([]byte, binary.MaxVarintLen64)
-		ln := binary.PutUvarint(lenBuf, uint64(len(ctrl)))
-		c.chunkBuf.Write(lenBuf[:ln])
+		ln := binary.PutUvarint(c.numBuf, uint64(len(ctrl)))
+		c.chunkBuf.Write(c.numBuf[:ln])
 		c.chunkBuf.Write(ctrl)
 		c.chunkBuf.Write(data)
 	}
@@ -922,6 +925,8 @@ func (d *streamVByteChunkedIntDecoder) remainingLen() int {
 
 // bytePositionForValue computes the byte offset in curChunkBytes for value index.
 // This enables the byte-copying optimization for StreamVByte.
+// Note: O(valueIdx) complexity since it walks all control bytes up to the target.
+// Only called via remainingLen() in the legacy byte-copying path (guarded by !UseStreamVByte).
 func (d *streamVByteChunkedIntDecoder) bytePositionForValue(valueIdx int) int {
 	if !d.isStreamVByteFormat() || len(d.control) == 0 {
 		return 0

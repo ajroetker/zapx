@@ -653,9 +653,6 @@ func (i *PostingsIterator) ReadLocationValuesForMerge(numLocValues int, fieldIDR
 	// Location format: [fieldID, pos, start, end, numArrayPos, arrayPos...]
 	idx := 0
 	for idx < len(vals) {
-		if idx >= len(vals) {
-			break
-		}
 		// Remap field ID
 		oldFieldID := vals[idx]
 		if int(oldFieldID) < len(fieldIDRemap) {

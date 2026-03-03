@@ -509,8 +509,8 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 	var locEncoder chunkedIntCoderI       // legacy single stream
 	var locFieldEncoder chunkedIntCoderI  // separated: field IDs only
 	var locValuesEncoder chunkedIntCoderI // separated: values only
-	useSeparatedIndex := UseStreamVByte && UseSeparatedFieldIDs
-	if useSeparatedIndex {
+	useSeparated := UseStreamVByte && UseSeparatedFieldIDs
+	if useSeparated {
 		locFieldEncoder = newLocEncoder(1024, uint64(len(io.results)-1))
 		locValuesEncoder = newLocEncoder(1024, uint64(len(io.results)-1))
 	} else {
@@ -558,7 +558,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				return err
 			}
 			tfEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
-			if useSeparatedIndex {
+			if useSeparated {
 				locFieldEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
 				locValuesEncoder.SetChunkSize(chunkSize, uint64(len(io.results)-1))
 			} else {
@@ -586,7 +586,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				}
 
 				if freqNorm.numLocs > 0 {
-					if useSeparatedIndex {
+					if useSeparated {
 						// Separated format: field IDs and values in separate streams
 						numLocs := freqNorm.numLocs
 
@@ -675,7 +675,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 			}
 
 			tfEncoder.Close()
-			if useSeparatedIndex {
+			if useSeparated {
 				locFieldEncoder.Close()
 				locValuesEncoder.Close()
 				io.incrementBytesWritten(locFieldEncoder.getBytesWritten())
@@ -687,7 +687,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 			io.incrementBytesWritten(tfEncoder.getBytesWritten())
 
 			var postingsOffset uint64
-			if useSeparatedIndex {
+			if useSeparated {
 				postingsOffset, err = writePostingsSeparated(postingsBS, tfEncoder,
 					locFieldEncoder, locValuesEncoder, nil, w, buf)
 			} else {
@@ -705,7 +705,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 			}
 
 			tfEncoder.Reset()
-			if useSeparatedIndex {
+			if useSeparated {
 				locFieldEncoder.Reset()
 				locValuesEncoder.Reset()
 			} else {

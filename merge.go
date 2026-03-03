@@ -22,12 +22,34 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	index "github.com/blevesearch/bleve_index_api"
 	seg "github.com/blevesearch/scorch_segment_api/v2"
 	"github.com/golang/snappy"
 )
+
+// mergeBufs holds reusable buffers for merge operations.
+// Pooled via mergeBufsPool to avoid allocations across concurrent merges.
+type mergeBufs struct {
+	bufLoc32 []uint32
+}
+
+var mergeBufsPool = sync.Pool{
+	New: func() interface{} { return &mergeBufs{} },
+}
+
+// separatedMergeBufs holds reusable buffers for separated-format merge operations.
+type separatedMergeBufs struct {
+	bufLoc32    []uint32
+	bufFieldIDs []uint32
+	bufValues   []uint32
+}
+
+var separatedMergeBufsPool = sync.Pool{
+	New: func() interface{} { return &separatedMergeBufs{} },
+}
 
 var DefaultFileMergerBufferSize = 1024 * 1024
 
@@ -290,11 +312,17 @@ func mergeTermFreqNormLocsByCopying(term []byte, postItr *PostingsIterator,
 	return lastDocNum, lastFreq, lastNorm, err
 }
 
-// bufLoc32 is a reusable buffer for batching uint32 location values
-var bufLoc32 []uint32
-
-// fieldIDRemap is a reusable buffer for field ID remapping during merge
-var fieldIDRemap []uint16
+// buildFieldIDRemap creates a mapping from source field IDs to destination field IDs.
+// Returns nil if fieldsInv is empty.
+func buildFieldIDRemap(fieldsMap map[string]uint16, fieldsInv []string) []uint16 {
+	remap := make([]uint16, len(fieldsInv))
+	for srcFieldID, fieldName := range fieldsInv {
+		if dstFieldID, ok := fieldsMap[fieldName]; ok {
+			remap[srcFieldID] = dstFieldID - 1 // destination field ID (0-based)
+		}
+	}
+	return remap
+}
 
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
@@ -305,20 +333,12 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 	// Build field ID remap only if fields differ
 	var remap []uint16
 	if postItr.mergeMode && !fieldsSame {
-		srcFieldsInv := postItr.postings.sb.fieldsInv
-		if cap(fieldIDRemap) < len(srcFieldsInv) {
-			fieldIDRemap = make([]uint16, len(srcFieldsInv))
-		} else {
-			fieldIDRemap = fieldIDRemap[:len(srcFieldsInv)]
-		}
-		for srcFieldID, fieldName := range srcFieldsInv {
-			if dstFieldID, ok := fieldsMap[fieldName]; ok {
-				fieldIDRemap[srcFieldID] = dstFieldID - 1 // destination field ID (0-based)
-			}
-		}
-		remap = fieldIDRemap
+		remap = buildFieldIDRemap(fieldsMap, postItr.postings.sb.fieldsInv)
 	}
 	// When fieldsSame is true, remap stays nil and no remapping occurs
+
+	mb := mergeBufsPool.Get().(*mergeBufs)
+	defer mergeBufsPool.Put(mb)
 
 	next, err := postItr.Next()
 	for next != nil && err == nil {
@@ -349,10 +369,10 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 			// Fall through to legacy path below
 			if hasLocs {
 				if nextFreq > 0 {
-					err = tfEncoder.Add(hitNewDocNum,
+					err = tfEncoder.Add2(hitNewDocNum,
 						encodeFreqHasLocs(nextFreq, hasLocs), nextNorm)
 				} else {
-					err = tfEncoder.Add(hitNewDocNum,
+					err = tfEncoder.Add1(hitNewDocNum,
 						encodeFreqHasLocs(nextFreq, hasLocs))
 				}
 				if err != nil {
@@ -418,14 +438,14 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 			}
 
 			// Ensure buffer is large enough
-			if cap(bufLoc32) < numLocValues {
-				bufLoc32 = make([]uint32, numLocValues*2)
+			if cap(mb.bufLoc32) < numLocValues {
+				mb.bufLoc32 = make([]uint32, numLocValues*2)
 			}
-			bufLoc32 = bufLoc32[:numLocValues]
+			mb.bufLoc32 = mb.bufLoc32[:numLocValues]
 
 			// Read and remap location values directly
 			// remap is nil when fieldsSame=true, skipping the remapping loop
-			vals, err := postItr.ReadLocationValuesForMerge(numLocValues, remap, bufLoc32)
+			vals, err := postItr.ReadLocationValuesForMerge(numLocValues, remap, mb.bufLoc32)
 			if err != nil {
 				return 0, 0, 0, nil, fmt.Errorf("read location values: %w", err)
 			}
@@ -446,10 +466,6 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 	return lastDocNum, lastFreq, lastNorm, bufLoc, err
 }
 
-// Buffers for separated format merge
-var bufFieldIDs []uint32
-var bufValues []uint32
-
 // mergeTermFreqNormLocsSeparated merges postings using separated field ID format.
 // Field IDs go to locFieldEncoder, values (pos, start, end, etc.) go to locValuesEncoder.
 // This enables the optimization where values can be copied directly without remapping.
@@ -463,20 +479,12 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 	// Build field ID remap only if fields differ
 	var remap []uint16
 	if !fieldsSame {
-		srcFieldsInv := postItr.postings.sb.fieldsInv
-		if cap(fieldIDRemap) < len(srcFieldsInv) {
-			fieldIDRemap = make([]uint16, len(srcFieldsInv))
-		} else {
-			fieldIDRemap = fieldIDRemap[:len(srcFieldsInv)]
-		}
-		for srcFieldID, fieldName := range srcFieldsInv {
-			if dstFieldID, ok := fieldsMap[fieldName]; ok {
-				fieldIDRemap[srcFieldID] = dstFieldID - 1 // destination field ID (0-based)
-			}
-		}
-		remap = fieldIDRemap
+		remap = buildFieldIDRemap(fieldsMap, postItr.postings.sb.fieldsInv)
 	}
 	// When fieldsSame is true, remap stays nil and no remapping occurs
+
+	smb := separatedMergeBufsPool.Get().(*separatedMergeBufs)
+	defer separatedMergeBufsPool.Put(smb)
 
 	next, err := postItr.Next()
 	for next != nil && err == nil {
@@ -523,13 +531,13 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				}
 
 				// Ensure field IDs buffer is large enough
-				if cap(bufFieldIDs) < numFieldIDs {
-					bufFieldIDs = make([]uint32, numFieldIDs*2)
+				if cap(smb.bufFieldIDs) < numFieldIDs {
+					smb.bufFieldIDs = make([]uint32, numFieldIDs*2)
 				}
-				bufFieldIDs = bufFieldIDs[:numFieldIDs]
+				smb.bufFieldIDs = smb.bufFieldIDs[:numFieldIDs]
 
 				// Read and remap field IDs (remap is nil when fieldsSame, skipping remapping)
-				fieldIDs, err := postItr.ReadFieldIDsForMerge(numFieldIDs, remap, bufFieldIDs)
+				fieldIDs, err := postItr.ReadFieldIDsForMerge(numFieldIDs, remap, smb.bufFieldIDs)
 				if err != nil {
 					return 0, 0, 0, nil, fmt.Errorf("read field IDs: %w", err)
 				}
@@ -546,13 +554,13 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				}
 
 				// Ensure values buffer is large enough
-				if cap(bufValues) < numValues {
-					bufValues = make([]uint32, numValues*2)
+				if cap(smb.bufValues) < numValues {
+					smb.bufValues = make([]uint32, numValues*2)
 				}
-				bufValues = bufValues[:numValues]
+				smb.bufValues = smb.bufValues[:numValues]
 
 				// Read values (no remapping needed)
-				values, err := postItr.ReadValuesForMerge(numValues, bufValues)
+				values, err := postItr.ReadValuesForMerge(numValues, smb.bufValues)
 				if err != nil {
 					return 0, 0, 0, nil, fmt.Errorf("read values: %w", err)
 				}
@@ -566,13 +574,13 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				// This is the slower path for backward compatibility
 
 				// Ensure buffer is large enough
-				if cap(bufLoc32) < numValues {
-					bufLoc32 = make([]uint32, numValues*2)
+				if cap(smb.bufLoc32) < numValues {
+					smb.bufLoc32 = make([]uint32, numValues*2)
 				}
-				bufLoc32 = bufLoc32[:numValues]
+				smb.bufLoc32 = smb.bufLoc32[:numValues]
 
 				// Read all values (legacy interleaved format)
-				vals, err := postItr.ReadLocationValuesForMerge(numValues, fieldIDRemap, bufLoc32)
+				vals, err := postItr.ReadLocationValuesForMerge(numValues, remap, smb.bufLoc32)
 				if err != nil {
 					return 0, 0, 0, nil, fmt.Errorf("read location values: %w", err)
 				}
@@ -592,10 +600,10 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				}
 
 				// Separate field IDs from values
-				if cap(bufFieldIDs) < numLocs {
-					bufFieldIDs = make([]uint32, numLocs*2)
+				if cap(smb.bufFieldIDs) < numLocs {
+					smb.bufFieldIDs = make([]uint32, numLocs*2)
 				}
-				bufFieldIDs = bufFieldIDs[:numLocs]
+				smb.bufFieldIDs = smb.bufFieldIDs[:numLocs]
 
 				valuesOnly := make([]uint32, 0, numValues-numLocs)
 
@@ -603,7 +611,7 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				locIdx := 0
 				for idx < len(vals) {
 					// Extract field ID
-					bufFieldIDs[locIdx] = vals[idx]
+					smb.bufFieldIDs[locIdx] = vals[idx]
 					locIdx++
 					idx++ // skip fieldID
 
@@ -628,7 +636,7 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
-				err = locFieldEncoder.AddValues32(hitNewDocNum, bufFieldIDs[:numLocs])
+				err = locFieldEncoder.AddValues32(hitNewDocNum, smb.bufFieldIDs[:numLocs])
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
