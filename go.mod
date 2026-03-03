@@ -3,8 +3,8 @@ module github.com/blevesearch/zapx/v17
 go 1.26
 
 require (
-	github.com/RoaringBitmap/roaring/v2 v2.14.4
-	github.com/ajroetker/go-highway v0.0.9
+	github.com/RoaringBitmap/roaring/v2 v2.14.5
+	github.com/ajroetker/go-highway v0.0.11
 	github.com/blevesearch/bleve_index_api v1.3.2
 	github.com/blevesearch/go-faiss v1.0.27
 	github.com/blevesearch/mmap-go v1.2.0
@@ -15,7 +15,7 @@ require (
 )
 
 require (
-	github.com/bits-and-blooms/bitset v1.24.2 // indirect
+	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect

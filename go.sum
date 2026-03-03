@@ -1,9 +1,15 @@
 github.com/RoaringBitmap/roaring/v2 v2.14.4 h1:4aKySrrg9G/5oRtJ3TrZLObVqxgQ9f1znCRBwEwjuVw=
 github.com/RoaringBitmap/roaring/v2 v2.14.4/go.mod h1:oMvV6omPWr+2ifRdeZvVJyaz+aoEUopyv5iH0u/+wbY=
+github.com/RoaringBitmap/roaring/v2 v2.14.5 h1:ckd0o545JqDPeVJDgeFoaM21eBixUnlWfYgjE5VnyWw=
+github.com/RoaringBitmap/roaring/v2 v2.14.5/go.mod h1:eq4wdNXxtJIS/oikeCzdX1rBzek7ANzbth041hrU8Q4=
 github.com/ajroetker/go-highway v0.0.9 h1:4e4OgXTDez1Qcvc6dPAgm9AtuXy9wW37oYRdm/Vft28=
 github.com/ajroetker/go-highway v0.0.9/go.mod h1:W3UXmddfmFXnc9B1Ej2T//LV8po9PcngyZ64LUXz2Fs=
+github.com/ajroetker/go-highway v0.0.11 h1:WWJfKK2oW7MheUYj7bUnJNn3XuHcWiBR5sDo9WwwP2c=
+github.com/ajroetker/go-highway v0.0.11/go.mod h1:yhghcLHlM/LHIaHUmFfl/Ej/mCKUow2RHF2+aX3UF4s=
 github.com/bits-and-blooms/bitset v1.24.2 h1:M7/NzVbsytmtfHbumG+K2bremQPMJuqv1JD3vOaFxp0=
 github.com/bits-and-blooms/bitset v1.24.2/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
+github.com/bits-and-blooms/bitset v1.24.4 h1:95H15Og1clikBrKr/DuzMXkQzECs1M6hhoGXLwLQOZE=
+github.com/bits-and-blooms/bitset v1.24.4/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/blevesearch/bleve_index_api v1.3.2 h1:y4VLXBF7nQR01CvF+QzmCJKMpVPCLp1CJ5FsRSZXzRE=
 github.com/blevesearch/bleve_index_api v1.3.2/go.mod h1:xvd48t5XMeeioWQ5/jZvgLrV98flT2rdvEJ3l/ki4Ko=
 github.com/blevesearch/go-faiss v1.0.27 h1:7cBImYDDQ82WJd5RUZ1ie6zXztCsC73W94ZzwOjkatk=
