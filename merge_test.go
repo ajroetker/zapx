@@ -772,7 +772,7 @@ func buildBenchmarkSegment(numDocs int) (*SegmentBase, error) {
 		results[i] = doc
 	}
 
-	seg, _, err := zapPlugin.newWithChunkMode(results, DefaultChunkMode)
+	seg, _, err := zapPlugin.newWithChunkMode(results, DefaultChunkMode, nil)
 	if err != nil {
 		return nil, err
 	}
