@@ -36,7 +36,7 @@ type invertedIndexCache struct {
 
 func (sc *invertedIndexCache) Clear() {
 	sc.m.Lock()
-	sc.cache = nil
+	clear(sc.cache)
 	sc.m.Unlock()
 }
 

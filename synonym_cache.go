@@ -37,7 +37,7 @@ type synonymIndexCache struct {
 // Clear clears the synonym cache which would mean tha the termID to term map would no longer be available.
 func (sc *synonymIndexCache) Clear() {
 	sc.m.Lock()
-	sc.cache = nil
+	clear(sc.cache)
 	sc.m.Unlock()
 }
 
