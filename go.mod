@@ -5,10 +5,10 @@ go 1.26
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.15.0
 	github.com/ajroetker/go-highway v0.0.12
-	github.com/blevesearch/bleve_index_api v1.3.2
-	github.com/blevesearch/go-faiss v1.0.27
+	github.com/blevesearch/bleve_index_api v1.3.4
+	github.com/blevesearch/go-faiss v1.0.28
 	github.com/blevesearch/mmap-go v1.2.0
-	github.com/blevesearch/scorch_segment_api/v2 v2.4.1
+	github.com/blevesearch/scorch_segment_api/v2 v2.4.3
 	github.com/blevesearch/vellum v1.2.0
 	github.com/golang/snappy v1.0.0
 	github.com/spf13/cobra v1.10.2
