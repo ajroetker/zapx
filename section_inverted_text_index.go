@@ -34,6 +34,22 @@ func init() {
 type invertedTextIndexSection struct {
 }
 
+func appendDocValueTerm(dst []byte, term []byte) []byte {
+	start := len(dst)
+	dst = append(dst, make([]byte, len(term)+1)...)
+	copy(dst[start:], term)
+	dst[len(dst)-1] = index.DocValueTermSeparator
+	return dst
+}
+
+func appendDocValueTermString(dst []byte, term string) []byte {
+	start := len(dst)
+	dst = append(dst, make([]byte, len(term)+1)...)
+	copy(dst[start:], term)
+	dst[len(dst)-1] = index.DocValueTermSeparator
+	return dst
+}
+
 // This function checks whether the inverted text index section should avoid processing
 // a particular field, preventing unnecessary work if another section will handle it.
 //
@@ -379,37 +395,36 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 		if fieldsOptions[fieldName].SkipDVChunking() {
 			chunkSize = 1
 		}
+		includeDocValues := fieldsOptions[fieldName].IncludeDocValues()
 		fdvEncoder := newChunkedContentCoder(chunkSize, newSegDocCount-1, w, true, fieldsOptions[fieldName].SkipDVCompression())
 
 		fdvReadersAvailable := false
-		var dvIterClone *docValueReader
-		var dvIter *docValueReader
-		for segmentI, segment := range segmentsInFocus {
-			// check for the closure in meantime
-			if isClosed(closeCh) {
-				return nil, seg.ErrClosed
-			}
-			// early exit if docvalues are not wanted for this field
-			if !fieldsOptions[fieldName].IncludeDocValues() {
-				continue
-			}
-			fieldIDPlus1 := uint16(segment.fieldsMap[fieldName])
-			dvIter = segment.fieldDvReaders[SectionInvertedTextIndex][fieldIDPlus1-1]
-			if dvIter != nil {
-				fdvReadersAvailable = true
-				dvIterClone = dvIter.cloneInto(dvIterClone)
-				err = dvIterClone.iterateAllDocValues(segment, func(docNum uint64, terms []byte) error {
-					if newDocNums[segmentI][docNum] == docDropped {
+		if includeDocValues {
+			var dvIterClone *docValueReader
+			var dvIter *docValueReader
+			for segmentI, segment := range segmentsInFocus {
+				// check for the closure in meantime
+				if isClosed(closeCh) {
+					return nil, seg.ErrClosed
+				}
+				fieldIDPlus1 := uint16(segment.fieldsMap[fieldName])
+				dvIter = segment.fieldDvReaders[SectionInvertedTextIndex][fieldIDPlus1-1]
+				if dvIter != nil {
+					fdvReadersAvailable = true
+					dvIterClone = dvIter.cloneInto(dvIterClone)
+					err = dvIterClone.iterateAllDocValues(segment, func(docNum uint64, terms []byte) error {
+						if newDocNums[segmentI][docNum] == docDropped {
+							return nil
+						}
+						err := fdvEncoder.Add(newDocNums[segmentI][docNum], terms)
+						if err != nil {
+							return err
+						}
 						return nil
-					}
-					err := fdvEncoder.Add(newDocNums[segmentI][docNum], terms)
+					})
 					if err != nil {
-						return err
+						return nil, err
 					}
-					return nil
-				})
-				if err != nil {
-					return nil, err
 				}
 			}
 		}
@@ -684,9 +699,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 
 				freqNormOffset++
 
-				docTermMap[docNum] = append(
-					append(docTermMap[docNum], term...),
-					index.DocValueTermSeparator)
+				docTermMap[docNum] = appendDocValueTermString(docTermMap[docNum], term)
 			}
 
 			tfEncoder.Close()
@@ -776,7 +789,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 				if fieldTermMap, ok := io.extraDocValues[docNum]; ok {
 					if sTerms, ok := fieldTermMap[uint16(fieldID)]; ok {
 						for _, sTerm := range sTerms {
-							docTerms = append(append(docTerms, sTerm...), index.DocValueTermSeparator)
+							docTerms = appendDocValueTerm(docTerms, sTerm)
 						}
 					}
 				}
