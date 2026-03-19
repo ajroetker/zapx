@@ -878,6 +878,87 @@ func BenchmarkMergeMultipleSegments(b *testing.B) {
 	}
 }
 
+// BenchmarkMergeLegacySourceToSeparated measures merging legacy StreamVByte
+// source segments into either legacy or separated-field-ID output.
+func BenchmarkMergeLegacySourceToSeparated(b *testing.B) {
+	for _, useSeparatedOutput := range []bool{false, true} {
+		name := "LegacyOutput"
+		if useSeparatedOutput {
+			name = "SeparatedOutput"
+		}
+		b.Run(name, func(b *testing.B) {
+			benchmarkMergeLegacySourceToSeparated(b, 1000, useSeparatedOutput)
+		})
+	}
+}
+
+func benchmarkMergeLegacySourceToSeparated(b *testing.B, numDocs int, useSeparatedOutput bool) {
+	origUseStreamVByte := UseStreamVByte
+	origUseSeparatedFieldIDs := UseSeparatedFieldIDs
+	defer func() {
+		UseStreamVByte = origUseStreamVByte
+		UseSeparatedFieldIDs = origUseSeparatedFieldIDs
+	}()
+
+	UseStreamVByte = true
+	UseSeparatedFieldIDs = false
+
+	tmpDir, err := os.MkdirTemp("", "zapx-bench-separated-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	seg1Path := tmpDir + "/seg1.zap"
+	seg2Path := tmpDir + "/seg2.zap"
+	mergedPath := tmpDir + "/merged.zap"
+
+	testSeg1, err := buildBenchmarkSegment(numDocs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := PersistSegmentBase(testSeg1, seg1Path); err != nil {
+		b.Fatal(err)
+	}
+
+	testSeg2, err := buildBenchmarkSegment(numDocs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := PersistSegmentBase(testSeg2, seg2Path); err != nil {
+		b.Fatal(err)
+	}
+
+	segment1, err := zapPlugin.Open(seg1Path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer segment1.Close()
+
+	segment2, err := zapPlugin.Open(seg2Path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer segment2.Close()
+
+	segsToMerge := []seg.Segment{segment1, segment2}
+	drops := []*roaring.Bitmap{nil, nil}
+
+	UseSeparatedFieldIDs = useSeparatedOutput
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		os.Remove(mergedPath)
+
+		_, _, err := zapPlugin.Merge(segsToMerge, drops, mergedPath, nil, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func benchmarkMergeMultiple(b *testing.B, numSegments, docsPerSeg int, useStreamVByte bool) {
 	origUseStreamVByte := UseStreamVByte
 	defer func() { UseStreamVByte = origUseStreamVByte }()

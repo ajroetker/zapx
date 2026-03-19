@@ -122,6 +122,9 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 	dicts := make([]*Dictionary, 0, len(segments))
 	itrs := make([]vellum.Iterator, 0, len(segments))
 	segmentsInFocus := make([]*SegmentBase, 0, len(segments))
+	termPostings := make([]*PostingsList, len(segments))
+	termFieldIDRemaps := make([][]uint16, len(segments))
+	segmentFieldIDRemaps := make([][]uint16, len(segments))
 	// for each field
 	for fieldID, fieldName := range fieldsInv {
 		// collect FST iterators from all active segments for this field
@@ -159,6 +162,14 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 					dicts = append(dicts, dict)
 					itrs = append(itrs, itr)
 					segmentsInFocus = append(segmentsInFocus, segment)
+					if fieldsSame {
+						termFieldIDRemaps[len(dicts)-1] = nil
+					} else {
+						if segmentFieldIDRemaps[segmentI] == nil {
+							segmentFieldIDRemaps[segmentI] = buildFieldIDRemap(fieldsMap, segment.fieldsInv)
+						}
+						termFieldIDRemaps[len(dicts)-1] = segmentFieldIDRemaps[segmentI]
+					}
 				}
 			}
 		}
@@ -256,12 +267,13 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 			if !bytes.Equal(prevTerm, term) || prevTerm == nil {
 				// compute cardinality of field-term in new seg
 				var newCard uint64
-				lowItrIdxs, lowItrVals := enumerator.GetLowIdxsAndValues()
-				for i, idx := range lowItrIdxs {
-					pl, err := dicts[idx].postingsListFromOffset(lowItrVals[i], drops[idx], nil)
+				for _, idx := range enumerator.lowIdxs {
+					pl, err := dicts[idx].postingsListFromOffset(
+						enumerator.currVs[idx], drops[idx], termPostings[idx])
 					if err != nil {
 						return nil, err
 					}
+					termPostings[idx] = pl
 					newCard += pl.Count()
 				}
 				// compute correct chunk size with this
@@ -279,10 +291,14 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 				}
 			}
 
-			postings, err = dicts[itrI].postingsListFromOffset(
-				postingsOffset, drops[itrI], postings)
-			if err != nil {
-				return nil, err
+			postings = termPostings[itrI]
+			if postings == nil || postings.postingsOffset != postingsOffset {
+				postings, err = dicts[itrI].postingsListFromOffset(
+					postingsOffset, drops[itrI], postings)
+				if err != nil {
+					return nil, err
+				}
+				termPostings[itrI] = postings
 			}
 
 			// Use merge-optimized iterator when StreamVByte is enabled
@@ -298,14 +314,13 @@ func mergeAndPersistInvertedSection(segments []*SegmentBase, dropsIn []*roaring.
 					tfEncoder, locEncoder)
 			} else if useSeparated {
 				// Separated field IDs format: field IDs and values in separate streams
-				// Pass fieldsSame to skip remapping when fields are identical
 				lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocsSeparated(
-					fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
-					tfEncoder, locFieldEncoder, locValuesEncoder, bufLoc, fieldsSame)
+					term, postItr, newDocNums[itrI], newRoaring,
+					tfEncoder, locFieldEncoder, locValuesEncoder, bufLoc, termFieldIDRemaps[itrI])
 			} else {
 				lastDocNum, lastFreq, lastNorm, bufLoc, err = mergeTermFreqNormLocs(
 					fieldsMap, term, postItr, newDocNums[itrI], newRoaring,
-					tfEncoder, locEncoder, bufLoc, fieldsSame)
+					tfEncoder, locEncoder, bufLoc, termFieldIDRemaps[itrI])
 			}
 			if err != nil {
 				return nil, err
@@ -573,12 +588,12 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 
 				// check if freq/norm is enabled
 				if freqNorm.freq > 0 {
-					err = tfEncoder.Add(docNum,
+					err = tfEncoder.Add2(docNum,
 						encodeFreqHasLocs(freqNorm.freq, freqNorm.numLocs > 0),
 						uint64(math.Float32bits(freqNorm.norm)))
 				} else {
 					// if disabled, then skip the norm part
-					err = tfEncoder.Add(docNum,
+					err = tfEncoder.Add1(docNum,
 						encodeFreqHasLocs(freqNorm.freq, freqNorm.numLocs > 0))
 				}
 				if err != nil {
@@ -591,7 +606,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 						numLocs := freqNorm.numLocs
 
 						// Write number of locations to both streams as prefix
-						err = locFieldEncoder.Add(docNum, uint64(numLocs))
+						err = locFieldEncoder.Add1(docNum, uint64(numLocs))
 						if err != nil {
 							return err
 						}
@@ -601,14 +616,14 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 						for _, loc := range locs[locOffset : locOffset+numLocs] {
 							valuesCount += 4 + len(loc.arrayposs) // pos, start, end, numAP, ap...
 						}
-						err = locValuesEncoder.Add(docNum, uint64(valuesCount))
+						err = locValuesEncoder.Add1(docNum, uint64(valuesCount))
 						if err != nil {
 							return err
 						}
 
 						// Write field IDs to field stream
 						for _, loc := range locs[locOffset : locOffset+numLocs] {
-							err = locFieldEncoder.Add(docNum, uint64(loc.fieldID))
+							err = locFieldEncoder.Add1(docNum, uint64(loc.fieldID))
 							if err != nil {
 								return err
 							}
@@ -646,7 +661,7 @@ func (io *invertedIndexOpaque) writeDicts(w *CountHashWriter) error {
 							}
 						}
 
-						err = locEncoder.Add(docNum, uint64(locSizePrefix))
+						err = locEncoder.Add1(docNum, uint64(locSizePrefix))
 						if err != nil {
 							return err
 						}

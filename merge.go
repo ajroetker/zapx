@@ -328,15 +328,8 @@ func buildFieldIDRemap(fieldsMap map[string]uint16, fieldsInv []string) []uint16
 func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
 	tfEncoder *chunkedIntCoder, locEncoder chunkedIntCoderI, bufLoc []uint64,
-	fieldsSame bool) (
+	remap []uint16) (
 	lastDocNum uint64, lastFreq uint64, lastNorm uint64, bufLocOut []uint64, err error) {
-
-	// Build field ID remap only if fields differ
-	var remap []uint16
-	if postItr.mergeMode && !fieldsSame {
-		remap = buildFieldIDRemap(fieldsMap, postItr.postings.sb.fieldsInv)
-	}
-	// When fieldsSame is true, remap stays nil and no remapping occurs
 
 	mb := mergeBufsPool.Get().(*mergeBufs)
 	defer mergeBufsPool.Put(mb)
@@ -388,7 +381,7 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 						loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
 				}
 
-				err = locEncoder.Add(hitNewDocNum, uint64(locSizePrefix))
+				err = locEncoder.Add1(hitNewDocNum, uint64(locSizePrefix))
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -471,18 +464,11 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 // Field IDs go to locFieldEncoder, values (pos, start, end, etc.) go to locValuesEncoder.
 // This enables the optimization where values can be copied directly without remapping.
 // When fieldsSame is true, field ID remapping is skipped entirely for faster merge.
-func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, postItr *PostingsIterator,
+func mergeTermFreqNormLocsSeparated(term []byte, postItr *PostingsIterator,
 	newDocNums []uint64, newRoaring *roaring.Bitmap,
 	tfEncoder *chunkedIntCoder, locFieldEncoder, locValuesEncoder chunkedIntCoderI, bufLoc []uint64,
-	fieldsSame bool) (
+	remap []uint16) (
 	lastDocNum uint64, lastFreq uint64, lastNorm uint64, bufLocOut []uint64, err error) {
-
-	// Build field ID remap only if fields differ
-	var remap []uint16
-	if !fieldsSame {
-		remap = buildFieldIDRemap(fieldsMap, postItr.postings.sb.fieldsInv)
-	}
-	// When fieldsSame is true, remap stays nil and no remapping occurs
 
 	smb := separatedMergeBufsPool.Get().(*separatedMergeBufs)
 	defer separatedMergeBufsPool.Put(smb)
@@ -526,7 +512,7 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				// Separated format source: read field IDs and values separately
 
 				// Add numFieldIDs prefix
-				err = locFieldEncoder.Add(hitNewDocNum, uint64(numFieldIDs))
+				err = locFieldEncoder.Add1(hitNewDocNum, uint64(numFieldIDs))
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -549,7 +535,7 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				}
 
 				// Add numValues prefix
-				err = locValuesEncoder.Add(hitNewDocNum, uint64(numValues))
+				err = locValuesEncoder.Add1(hitNewDocNum, uint64(numValues))
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -586,33 +572,23 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 					return 0, 0, 0, nil, fmt.Errorf("read location values: %w", err)
 				}
 
-				// Count locations to determine how many field IDs
-				numLocs := 0
+				// Split field IDs from values in one pass.
+				// Max possible locations is numValues/5, since each location
+				// contributes at least fieldID,pos,start,end,numAP.
+				maxLocs := (numValues + 4) / 5
+				if cap(smb.bufFieldIDs) < maxLocs {
+					smb.bufFieldIDs = make([]uint32, maxLocs*2)
+				}
+				smb.bufFieldIDs = smb.bufFieldIDs[:maxLocs]
+
+				if cap(smb.bufValuesOnly) < numValues {
+					smb.bufValuesOnly = make([]uint32, numValues*2)
+				}
+				valuesOnly := smb.bufValuesOnly[:numValues]
+
 				idx := 0
-				for idx < len(vals) {
-					numLocs++
-					idx++ // fieldID
-					if idx+4 > len(vals) {
-						break
-					}
-					idx += 4 // pos, start, end, numAP
-					numAP := int(vals[idx-1])
-					idx += numAP
-				}
-
-				// Separate field IDs from values
-				if cap(smb.bufFieldIDs) < numLocs {
-					smb.bufFieldIDs = make([]uint32, numLocs*2)
-				}
-				smb.bufFieldIDs = smb.bufFieldIDs[:numLocs]
-
-				if cap(smb.bufValuesOnly) < numValues-numLocs {
-					smb.bufValuesOnly = make([]uint32, 0, (numValues-numLocs)*2)
-				}
-				valuesOnly := smb.bufValuesOnly[:0]
-
-				idx = 0
 				locIdx := 0
+				valuesIdx := 0
 				for idx < len(vals) {
 					// Extract field ID
 					smb.bufFieldIDs[locIdx] = vals[idx]
@@ -624,19 +600,21 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 					}
 
 					// Copy values (pos, start, end, numAP)
-					valuesOnly = append(valuesOnly, vals[idx:idx+4]...)
+					valuesIdx += copy(valuesOnly[valuesIdx:], vals[idx:idx+4])
 					numAP := int(vals[idx+3])
 					idx += 4
 
 					// Copy array positions
 					if numAP > 0 {
-						valuesOnly = append(valuesOnly, vals[idx:idx+numAP]...)
+						valuesIdx += copy(valuesOnly[valuesIdx:], vals[idx:idx+numAP])
 						idx += numAP
 					}
 				}
+				numLocs := locIdx
+				valuesOnly = valuesOnly[:valuesIdx]
 
 				// Write to separated encoders
-				err = locFieldEncoder.Add(hitNewDocNum, uint64(numLocs))
+				err = locFieldEncoder.Add1(hitNewDocNum, uint64(numLocs))
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -645,7 +623,7 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 					return 0, 0, 0, nil, err
 				}
 
-				err = locValuesEncoder.Add(hitNewDocNum, uint64(len(valuesOnly)))
+				err = locValuesEncoder.Add1(hitNewDocNum, uint64(len(valuesOnly)))
 				if err != nil {
 					return 0, 0, 0, nil, err
 				}
@@ -819,6 +797,7 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 	vals := make([][][]byte, len(fieldsInv))
 	typs := make([][]byte, len(fieldsInv))
 	poss := make([][][]uint64, len(fieldsInv))
+	storedFieldRemaps := make([][]int, len(segments))
 
 	var posBuf []uint64
 
@@ -835,6 +814,23 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 		}
 
 		segNewDocNums := make([]uint64, segment.numDocs)
+		if storedFieldRemaps[segI] == nil {
+			remap := make([]int, len(segment.fieldsInv))
+			for i := range remap {
+				remap[i] = -1
+			}
+			for srcFieldID, field := range segment.fieldsInv {
+				dstFieldID, ok := fieldsMap[field]
+				if !ok {
+					continue
+				}
+				if !fieldsOptions[field].IsStored() {
+					continue
+				}
+				remap[srcFieldID] = int(dstFieldID) - 1
+			}
+			storedFieldRemaps[segI] = remap
+		}
 
 		dropsI := drops[segI]
 
@@ -870,6 +866,7 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 			curr = 0
 			metaBuf.Reset()
 			data = data[:0]
+			idFieldVal := []byte(nil)
 
 			posTemp := posBuf
 
@@ -879,14 +876,15 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 				typs[i] = typs[i][:0]
 				poss[i] = poss[i][:0]
 			}
-			err := segment.visitStoredFields(vdc, docNum, func(field string, typ byte, value []byte, pos []uint64) bool {
-				fieldID := int(fieldsMap[field]) - 1
-				if fieldID < 0 {
-					// no entry for field in fieldsMap
-					return false
+			err := segment.visitStoredFieldsByID(vdc, docNum, func(srcFieldID uint16, typ byte, value []byte, pos []uint64) bool {
+				if srcFieldID == 0 {
+					idFieldVal = value
+					return true
 				}
-				// early exit if the store is not wanted for this field
-				if !fieldsOptions[field].IsStored() {
+
+				fieldID := storedFieldRemaps[segI][srcFieldID]
+				if fieldID < 0 {
+					// field not present in merged schema or no longer stored
 					return true
 				}
 				vals[fieldID] = append(vals[fieldID], value)
@@ -910,9 +908,11 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 			if err != nil {
 				return 0, nil, err
 			}
+			if idFieldVal == nil {
+				return 0, nil, fmt.Errorf("stored _id field missing for doc %d", docNum)
+			}
 
 			// _id field special case optimizes ExternalID() lookups
-			idFieldVal := vals[uint16(0)][0]
 			_, err = metaEncode(uint64(len(idFieldVal)))
 			if err != nil {
 				return 0, nil, err

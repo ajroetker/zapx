@@ -498,6 +498,8 @@ type visitDocumentCtx struct {
 	arrayPos []uint64
 }
 
+type storedFieldIDVisitor func(fieldID uint16, typ byte, value []byte, pos []uint64) bool
+
 var visitDocumentCtxPool = sync.Pool{
 	New: func() interface{} {
 		reuse := &visitDocumentCtx{}
@@ -515,6 +517,13 @@ func (sb *SegmentBase) VisitStoredFields(num uint64, visitor segment.StoredField
 
 func (sb *SegmentBase) visitStoredFields(vdc *visitDocumentCtx, num uint64,
 	visitor segment.StoredFieldValueVisitor) error {
+	return sb.visitStoredFieldsByID(vdc, num, func(fieldID uint16, typ byte, value []byte, pos []uint64) bool {
+		return visitor(sb.fieldsInv[fieldID], typ, value, pos)
+	})
+}
+
+func (sb *SegmentBase) visitStoredFieldsByID(vdc *visitDocumentCtx, num uint64,
+	visitor storedFieldIDVisitor) error {
 	// first make sure this is a valid number in this segment
 	if num < sb.numDocs {
 		meta, compressed := sb.getDocStoredMetaAndCompressed(num)
@@ -528,7 +537,7 @@ func (sb *SegmentBase) visitStoredFields(vdc *visitDocumentCtx, num uint64,
 		}
 		idFieldVal := compressed[:idFieldValLen]
 
-		keepGoing := visitor("_id", byte('t'), idFieldVal, nil)
+		keepGoing := visitor(0, byte('t'), idFieldVal, nil)
 		if !keepGoing {
 			visitDocumentCtxPool.Put(vdc)
 			return nil
@@ -581,7 +590,7 @@ func (sb *SegmentBase) visitStoredFields(vdc *visitDocumentCtx, num uint64,
 				}
 			}
 			value := uncompressed[offset : offset+l]
-			keepGoing = visitor(sb.fieldsInv[field], byte(typ), value, arrayPos)
+			keepGoing = visitor(uint16(field), byte(typ), value, arrayPos)
 		}
 
 		vdc.buf = uncompressed
