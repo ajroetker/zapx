@@ -26,24 +26,19 @@ import (
 // then writes out the roaring bitmap itself
 func writeRoaringWithLen(r *roaring.Bitmap, w io.Writer,
 	reuseBufVarint []byte) (int, error) {
-	buf, err := r.ToBytes()
-	if err != nil {
-		return 0, err
-	}
-
 	var tw int
 
-	// write out the length
-	n := binary.PutUvarint(reuseBufVarint, uint64(len(buf)))
+	// write out the length using the precomputed serialized size
+	n := binary.PutUvarint(reuseBufVarint, r.GetSerializedSizeInBytes())
 	nw, err := w.Write(reuseBufVarint[:n])
 	tw += nw
 	if err != nil {
 		return tw, err
 	}
 
-	// write out the roaring bytes
-	nw, err = w.Write(buf)
-	tw += nw
+	// write the roaring bytes directly to the writer
+	nw64, err := r.WriteTo(w)
+	tw += int(nw64)
 	if err != nil {
 		return tw, err
 	}
@@ -120,61 +115,52 @@ func persistFooter(numDocs, storedIndexOffset, sectionsIndexOffset uint64,
 	w := NewCountHashWriter(writerIn)
 	w.crc = crcBeforeFooter
 
-	// To be replaced with writer id (unused for now)
-	tempId := []byte("")
+	// Pre-encode all footer fields into a single buffer to avoid
+	// per-field binary.Write allocations (which use reflection).
+	// Layout: idLen(4) + numDocs(8) + storedIndexOffset(8) +
+	//         sectionsIndexOffset(8) + chunkMode(4) + version(4) + crc(4) = 40 bytes
+	var buf [FooterSize]byte
+	pos := 0
 
-	// Write the writer id
-	err := binary.Write(w, binary.BigEndian, tempId)
+	// writer id length (unused, always 0)
+	binary.BigEndian.PutUint32(buf[pos:], 0)
+	pos += 4
+
+	// number of docs
+	binary.BigEndian.PutUint64(buf[pos:], numDocs)
+	pos += 8
+
+	// stored field index location
+	binary.BigEndian.PutUint64(buf[pos:], storedIndexOffset)
+	pos += 8
+
+	// sections index location
+	binary.BigEndian.PutUint64(buf[pos:], sectionsIndexOffset)
+	pos += 8
+
+	// chunk mode
+	binary.BigEndian.PutUint32(buf[pos:], chunkMode)
+	pos += 4
+
+	// version
+	binary.BigEndian.PutUint32(buf[pos:], Version)
+	pos += 4
+
+	// write everything except CRC to update the hash
+	_, err := w.Write(buf[:pos])
 	if err != nil {
 		return err
 	}
 
-	// Write the length of the writer id
-	err = binary.Write(w, binary.BigEndian, uint32(len(tempId)))
-	if err != nil {
-		return err
-	}
-
-	// write out the number of docs
-	err = binary.Write(w, binary.BigEndian, numDocs)
-	if err != nil {
-		return err
-	}
-
-	// write out the stored field index location:
-	err = binary.Write(w, binary.BigEndian, storedIndexOffset)
-	if err != nil {
-		return err
-	}
-
-	// write out the sections index location
-	err = binary.Write(w, binary.BigEndian, sectionsIndexOffset)
-	if err != nil {
-		return err
-	}
-
-	// write out 32-bit chunk factor
-	err = binary.Write(w, binary.BigEndian, chunkMode)
-	if err != nil {
-		return err
-	}
-
-	// write out 32-bit version
-	err = binary.Write(w, binary.BigEndian, Version)
-	if err != nil {
-		return err
-	}
-
-	// write out CRC-32 of everything upto but not including this CRC
-	err = binary.Write(w, binary.BigEndian, w.crc)
-	if err != nil {
-		return err
-	}
-	return nil
+	// write CRC-32 of everything up to but not including this CRC
+	binary.BigEndian.PutUint32(buf[pos:], w.crc)
+	_, err = w.Write(buf[pos : pos+4])
+	return err
 }
 
 func writeUvarints(w io.Writer, vals ...uint64) (tw int, err error) {
-	buf := make([]byte, binary.MaxVarintLen64)
+	var tmp [binary.MaxVarintLen64]byte
+	buf := tmp[:]
 	for _, val := range vals {
 		n := binary.PutUvarint(buf, val)
 		var nw int

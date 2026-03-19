@@ -42,9 +42,10 @@ var mergeBufsPool = sync.Pool{
 
 // separatedMergeBufs holds reusable buffers for separated-format merge operations.
 type separatedMergeBufs struct {
-	bufLoc32    []uint32
-	bufFieldIDs []uint32
-	bufValues   []uint32
+	bufLoc32      []uint32
+	bufFieldIDs   []uint32
+	bufValues     []uint32
+	bufValuesOnly []uint32
 }
 
 var separatedMergeBufsPool = sync.Pool{
@@ -605,7 +606,10 @@ func mergeTermFreqNormLocsSeparated(fieldsMap map[string]uint16, term []byte, po
 				}
 				smb.bufFieldIDs = smb.bufFieldIDs[:numLocs]
 
-				valuesOnly := make([]uint32, 0, numValues-numLocs)
+				if cap(smb.bufValuesOnly) < numValues-numLocs {
+					smb.bufValuesOnly = make([]uint32, 0, (numValues-numLocs)*2)
+				}
+				valuesOnly := smb.bufValuesOnly[:0]
 
 				idx = 0
 				locIdx := 0
@@ -977,8 +981,10 @@ func mergeStoredAndRemap(segments []*SegmentBase, drops []*roaring.Bitmap,
 	storedIndexOffset := uint64(w.Count())
 
 	// now write out the stored doc index
+	var buf8 [8]byte
 	for _, docNumOffset := range docNumOffsets {
-		err := binary.Write(w, binary.BigEndian, docNumOffset)
+		binary.BigEndian.PutUint64(buf8[:], docNumOffset)
+		_, err := w.Write(buf8[:])
 		if err != nil {
 			return 0, nil, err
 		}

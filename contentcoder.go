@@ -118,10 +118,11 @@ func (c *chunkedContentCoder) getBytesWritten() uint64 {
 func (c *chunkedContentCoder) writeChunkMeta() ([]byte, error) {
 
 	// flush the contents, with meta information at first
-	buf := make([]byte, binary.MaxVarintLen64)
+	var buf [binary.MaxVarintLen64]byte
 	var metaData []byte
-	n := binary.PutUvarint(buf, uint64(len(c.chunkMeta)))
+	n := binary.PutUvarint(buf[:], uint64(len(c.chunkMeta)))
 	_, err := c.chunkMetaBuf.Write(buf[:n])
+
 	if err != nil {
 		return nil, err
 	}

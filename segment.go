@@ -636,9 +636,11 @@ func (sb *SegmentBase) DocNumbers(ids []string) (*roaring.Bitmap, error) {
 			return nil, err
 		}
 		sMaxStr := string(sMax)
+		var scratch []byte
 		for _, id := range ids {
 			if id <= sMaxStr {
-				postingsList, err = idDict.postingsList([]byte(id), nil, postingsList)
+				scratch = append(scratch[:0], id...)
+				postingsList, err = idDict.postingsList(scratch, nil, postingsList)
 				if err != nil {
 					return nil, err
 				}

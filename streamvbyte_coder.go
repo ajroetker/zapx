@@ -390,35 +390,34 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 		}
 	}
 
-	// Encode each column with StreamVByte
-	// We'll build the chunk in a temporary buffer first to calculate size
-	c.chunkBuf.Reset()
+	// Encode each column with StreamVByte, writing directly to final
+	startLen := len(c.final)
 
 	// Write format byte
-	c.chunkBuf.WriteByte(ChunkFormatColumnar)
+	c.final = append(c.final, ChunkFormatColumnar)
 
 	// Write header: numDocs, numLocs, numArrayPos
 	n := binary.PutUvarint(c.numBuf, uint64(numDocs))
 	n += binary.PutUvarint(c.numBuf[n:], uint64(numLocs))
 	n += binary.PutUvarint(c.numBuf[n:], uint64(numArrayPos))
-	c.chunkBuf.Write(c.numBuf[:n])
+	c.final = append(c.final, c.numBuf[:n]...)
 
-	// Helper to encode and write a column
+	// Helper to encode and append a column directly to final
 	writeColumn := func(values []uint32) {
 		if len(values) == 0 {
 			// Write 0 control length for empty column
-			c.chunkBuf.WriteByte(0)
+			c.final = append(c.final, 0)
 			return
 		}
 		ctrl, data := varint.EncodeStreamVByte32Into(values, c.controlBuf, c.dataBuf)
 		c.controlBuf = ctrl
 		c.dataBuf = data
 
-		// Write controlLen + control + data
+		// Append controlLen + control + data
 		ln := binary.PutUvarint(c.numBuf, uint64(len(ctrl)))
-		c.chunkBuf.Write(c.numBuf[:ln])
-		c.chunkBuf.Write(ctrl)
-		c.chunkBuf.Write(data)
+		c.final = append(c.final, c.numBuf[:ln]...)
+		c.final = append(c.final, ctrl...)
+		c.final = append(c.final, data...)
 	}
 
 	// Write columns in order
@@ -432,12 +431,9 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 		writeColumn(c.colArrayPos)
 	}
 
-	// Copy to final
-	encodingBytes := c.chunkBuf.Bytes()
-	c.incrementBytesWritten(uint64(len(encodingBytes)))
-	c.chunkLens[c.currChunk] = uint64(len(encodingBytes))
-	c.final = append(c.final, encodingBytes...)
-	c.chunkBuf.Reset()
+	chunkSize := len(c.final) - startLen
+	c.incrementBytesWritten(uint64(chunkSize))
+	c.chunkLens[c.currChunk] = uint64(chunkSize)
 	c.currChunk = uint64(cap(c.chunkLens))
 }
 
@@ -510,6 +506,15 @@ type streamVByteChunkedIntDecoder struct {
 	headerLen  int    // Length of format + numValues + controlLen prefix
 	controlLen int    // Length of control bytes
 	control    []byte // Control bytes (for computing byte positions)
+
+	// Reusable buffers for columnar decoding to reduce allocations
+	decCounts    []uint32
+	decFieldIDs  []uint32
+	decPositions []uint32
+	decStarts    []uint32
+	decEnds      []uint32
+	decNumAPs    []uint32
+	decArrayPos  []uint32
 
 	// Fallback varint reader for legacy chunks
 	r *memUvarintReader
@@ -670,8 +675,8 @@ func (d *streamVByteChunkedIntDecoder) loadChunkColumnar() error {
 	}
 	offset += n
 
-	// Helper to read and decode a column
-	readColumn := func(numValues int) ([]uint32, error) {
+	// Helper to read and decode a column into a reusable buffer
+	readColumnInto := func(numValues int, buf []uint32) ([]uint32, error) {
 		ctrlLen, n := binary.Uvarint(d.curChunkBytes[offset:])
 		if n <= 0 {
 			return nil, fmt.Errorf("invalid columnar chunk: can't read control length")
@@ -699,65 +704,74 @@ func (d *streamVByteChunkedIntDecoder) loadChunkColumnar() error {
 		dataBytes := d.curChunkBytes[offset : offset+dataLen]
 		offset += dataLen
 
-		result := make([]uint32, numValues)
-		varint.DecodeStreamVByte32Into(ctrl, dataBytes, result)
-		return result, nil
+		if cap(buf) >= numValues {
+			buf = buf[:numValues]
+		} else {
+			buf = make([]uint32, numValues)
+		}
+		varint.DecodeStreamVByte32Into(ctrl, dataBytes, buf)
+		return buf, nil
 	}
 
-	// Read all columns
-	counts, err := readColumn(int(numDocs))
+	// Read all columns into reusable decoder buffers
+	counts, err := readColumnInto(int(numDocs), d.decCounts)
 	if err != nil {
 		return err
 	}
+	d.decCounts = counts
 
-	fieldIDs, err := readColumn(int(numLocs))
+	fieldIDs, err := readColumnInto(int(numLocs), d.decFieldIDs)
 	if err != nil {
 		return err
 	}
+	d.decFieldIDs = fieldIDs
 
-	positions, err := readColumn(int(numLocs))
+	positions, err := readColumnInto(int(numLocs), d.decPositions)
 	if err != nil {
 		return err
 	}
+	d.decPositions = positions
 
-	startDeltas, err := readColumn(int(numLocs))
+	startDeltas, err := readColumnInto(int(numLocs), d.decStarts)
 	if err != nil {
 		return err
 	}
+	d.decStarts = startDeltas
 
-	endDeltas, err := readColumn(int(numLocs))
+	endDeltas, err := readColumnInto(int(numLocs), d.decEnds)
 	if err != nil {
 		return err
 	}
+	d.decEnds = endDeltas
 
-	numAPs, err := readColumn(int(numLocs))
+	numAPs, err := readColumnInto(int(numLocs), d.decNumAPs)
 	if err != nil {
 		return err
 	}
+	d.decNumAPs = numAPs
 
 	var arrayPositions []uint32
 	if numArrayPos > 0 {
-		arrayPositions, err = readColumn(int(numArrayPos))
+		arrayPositions, err = readColumnInto(int(numArrayPos), d.decArrayPos)
 		if err != nil {
 			return err
 		}
+		d.decArrayPos = arrayPositions
 	}
 
-	// Delta decode starts
-	starts := make([]uint32, numLocs)
+	// Delta decode starts (in-place)
+	starts := startDeltas
 	if numLocs > 0 {
-		starts[0] = startDeltas[0]
 		for i := 1; i < int(numLocs); i++ {
-			starts[i] = starts[i-1] + startDeltas[i]
+			starts[i] = starts[i-1] + starts[i]
 		}
 	}
 
-	// Delta decode ends
-	ends := make([]uint32, numLocs)
+	// Delta decode ends (in-place)
+	ends := endDeltas
 	if numLocs > 0 {
-		ends[0] = endDeltas[0]
 		for i := 1; i < int(numLocs); i++ {
-			ends[i] = ends[i-1] + endDeltas[i]
+			ends[i] = ends[i-1] + ends[i]
 		}
 	}
 
