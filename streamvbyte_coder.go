@@ -58,7 +58,8 @@ var UseDeltaEncoding = false
 var UseColumnarLocations = true
 
 // StreamVByte chunk format:
-//   [format byte] [numValues varint] [controlLen varint] [control bytes] [data bytes]
+//
+//	[format byte] [numValues varint] [controlLen varint] [control bytes] [data bytes]
 //
 // Format byte values:
 const (
@@ -67,6 +68,18 @@ const (
 	ChunkFormatStreamVByteDelta = 0x02 // StreamVByte with naive delta encoding (disabled)
 	ChunkFormatColumnar         = 0x03 // Columnar format with delta encoding for start/end
 )
+
+var streamVByteControlByteLengths [256]uint8
+
+func init() {
+	for ctrl := range streamVByteControlByteLengths {
+		length := 0
+		for shift := 0; shift < 8; shift += 2 {
+			length += int((byte(ctrl)>>shift)&0x03) + 1
+		}
+		streamVByteControlByteLengths[ctrl] = uint8(length)
+	}
+}
 
 // SeparatedLocFormatMarker is a 2-byte marker indicating separated field ID encoding.
 // The sequence 0xFF 0x00 can't be a valid varint because:
@@ -120,11 +133,11 @@ func newStreamVByteChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *streamVB
 		chunkLens:    make([]uint64, total),
 		final:        make([]byte, 0, estimatedFinalSize),
 		chunkValues:  make([]uint32, 0, 512), // larger initial capacity
-		numBuf:      make([]byte, binary.MaxVarintLen64*3),
-		controlBuf:  make([]byte, 0, 128),  // larger for bigger chunks
-		dataBuf:     make([]byte, 0, 2048), // larger for bigger chunks
-		deltaBuf:    make([]uint32, 0, 512),
-		endDeltaBuf: make([]uint32, 0, 512),
+		numBuf:       make([]byte, binary.MaxVarintLen64*3),
+		controlBuf:   make([]byte, 0, 128),  // larger for bigger chunks
+		dataBuf:      make([]byte, 0, 2048), // larger for bigger chunks
+		deltaBuf:     make([]uint32, 0, 512),
+		endDeltaBuf:  make([]uint32, 0, 512),
 		colCounts:    make([]uint32, 0, 32),
 		colFieldIDs:  make([]uint32, 0, 128),
 		colPositions: make([]uint32, 0, 128),
@@ -318,12 +331,14 @@ func (c *streamVByteChunkedIntCoder) Close() {
 // for monotonically increasing start/end byte offsets.
 //
 // Location data format in chunkValues:
-//   [count1] [fieldID, pos, start, end, numAP, (arrayPos...)]* [count2] ...
+//
+//	[count1] [fieldID, pos, start, end, numAP, (arrayPos...)]* [count2] ...
 //
 // Columnar output format:
-//   [format=0x03] [numDocs] [numLocs] [numArrayPos]
-//   [counts column] [fieldIDs column] [positions column]
-//   [starts column (delta)] [ends column (delta)] [numAPs column] [arrayPos column]
+//
+//	[format=0x03] [numDocs] [numLocs] [numArrayPos]
+//	[counts column] [fieldIDs column] [positions column]
+//	[starts column (delta)] [ends column (delta)] [numAPs column] [arrayPos column]
 func (c *streamVByteChunkedIntCoder) closeColumnar() {
 	// Reset columnar buffers
 	c.colCounts = c.colCounts[:0]
@@ -650,9 +665,10 @@ func (d *streamVByteChunkedIntDecoder) loadChunk(chunk int) error {
 // interleaved location data format for compatibility with existing code.
 //
 // Columnar format:
-//   [format=0x03] [numDocs] [numLocs] [numArrayPos]
-//   [counts column] [fieldIDs column] [positions column]
-//   [starts column (delta)] [ends column (delta)] [numAPs column] [arrayPos column]
+//
+//	[format=0x03] [numDocs] [numLocs] [numArrayPos]
+//	[counts column] [fieldIDs column] [positions column]
+//	[starts column (delta)] [ends column (delta)] [numAPs column] [arrayPos column]
 func (d *streamVByteChunkedIntDecoder) loadChunkColumnar() error {
 	offset := 1
 
@@ -690,15 +706,9 @@ func (d *streamVByteChunkedIntDecoder) loadChunkColumnar() error {
 		ctrl := d.curChunkBytes[offset : offset+int(ctrlLen)]
 		offset += int(ctrlLen)
 
-		// Calculate data length from control bytes
-		// StreamVByte always encodes in groups of 4 with padding, so we process
-		// all 4 slots per control byte regardless of actual numValues
 		dataLen := 0
-		for i := 0; i < int(ctrlLen); i++ {
-			for j := 0; j < 4; j++ {
-				size := int((ctrl[i]>>(j*2))&0x03) + 1
-				dataLen += size
-			}
+		for _, ctrlByte := range ctrl {
+			dataLen += int(streamVByteControlByteLengths[ctrlByte])
 		}
 
 		dataBytes := d.curChunkBytes[offset : offset+dataLen]

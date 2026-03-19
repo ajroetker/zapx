@@ -755,6 +755,10 @@ func TestUnder32Bits(t *testing.T) {
 // buildBenchmarkSegment creates a segment with numDocs documents for benchmarking.
 // Each document has multiple fields with location data to exercise the location encoder/decoder.
 func buildBenchmarkSegment(numDocs int) (*SegmentBase, error) {
+	return buildBenchmarkSegmentWithDocValues(numDocs, false)
+}
+
+func buildBenchmarkSegmentWithDocValues(numDocs int, includeDocValues bool) (*SegmentBase, error) {
 	results := make([]index.Document, numDocs)
 
 	for i := 0; i < numDocs; i++ {
@@ -762,12 +766,12 @@ func buildBenchmarkSegment(numDocs int) (*SegmentBase, error) {
 		// Create document with multiple fields and array positions to generate location data
 		doc := newStubDocument(docID, []*stubField{
 			newStubFieldSplitString("_id", nil, docID, true, false, false),
-			newStubFieldSplitString("title", nil, fmt.Sprintf("title words for document %d with more text", i), true, false, true),
-			newStubFieldSplitString("body", nil, fmt.Sprintf("body content with many words for document %d to create location data entries", i), true, false, true),
-			newStubFieldSplitString("tag", []uint64{0}, "alpha", true, false, true),
-			newStubFieldSplitString("tag", []uint64{1}, "beta", true, false, true),
-			newStubFieldSplitString("tag", []uint64{2}, "gamma", true, false, true),
-			newStubFieldSplitString("category", nil, fmt.Sprintf("cat%d", i%10), true, false, true),
+			newStubFieldSplitString("title", nil, fmt.Sprintf("title words for document %d with more text", i), true, includeDocValues, true),
+			newStubFieldSplitString("body", nil, fmt.Sprintf("body content with many words for document %d to create location data entries", i), true, includeDocValues, true),
+			newStubFieldSplitString("tag", []uint64{0}, "alpha", true, includeDocValues, true),
+			newStubFieldSplitString("tag", []uint64{1}, "beta", true, includeDocValues, true),
+			newStubFieldSplitString("tag", []uint64{2}, "gamma", true, includeDocValues, true),
+			newStubFieldSplitString("category", nil, fmt.Sprintf("cat%d", i%10), true, includeDocValues, true),
 		}, "_all")
 		results[i] = doc
 	}
@@ -878,6 +882,12 @@ func BenchmarkMergeMultipleSegments(b *testing.B) {
 	}
 }
 
+func BenchmarkMergeDocValuesMultipleSegments(b *testing.B) {
+	b.Run("Segs8/StreamVByte", func(b *testing.B) {
+		benchmarkMergeMultipleWithOptions(b, 8, 100, true, true)
+	})
+}
+
 // BenchmarkMergeLegacySourceToSeparated measures merging legacy StreamVByte
 // source segments into either legacy or separated-field-ID output.
 func BenchmarkMergeLegacySourceToSeparated(b *testing.B) {
@@ -960,6 +970,11 @@ func benchmarkMergeLegacySourceToSeparated(b *testing.B, numDocs int, useSeparat
 }
 
 func benchmarkMergeMultiple(b *testing.B, numSegments, docsPerSeg int, useStreamVByte bool) {
+	benchmarkMergeMultipleWithOptions(b, numSegments, docsPerSeg, useStreamVByte, false)
+}
+
+func benchmarkMergeMultipleWithOptions(b *testing.B, numSegments, docsPerSeg int,
+	useStreamVByte bool, includeDocValues bool) {
 	origUseStreamVByte := UseStreamVByte
 	defer func() { UseStreamVByte = origUseStreamVByte }()
 	UseStreamVByte = useStreamVByte
@@ -976,7 +991,7 @@ func benchmarkMergeMultiple(b *testing.B, numSegments, docsPerSeg int, useStream
 
 	for i := 0; i < numSegments; i++ {
 		segPath := fmt.Sprintf("%s/seg%d.zap", tmpDir, i)
-		testSeg, err := buildBenchmarkSegment(docsPerSeg)
+		testSeg, err := buildBenchmarkSegmentWithDocValues(docsPerSeg, includeDocValues)
 		if err != nil {
 			b.Fatal(err)
 		}
