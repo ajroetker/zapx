@@ -373,12 +373,19 @@ func mergeTermFreqNormLocs(fieldsMap map[string]uint16, term []byte, postItr *Po
 					return 0, 0, 0, nil, err
 				}
 
-				// Count bytes for varint encoding
+				// The location prefix is a byte count for legacy varint chunks,
+				// but StreamVByte chunks store decoded value counts. The columnar
+				// StreamVByte encoder depends on the prefix matching the number of
+				// values that follow for this document.
 				var locSizePrefix int
 				for _, loc := range locs {
 					ap := loc.ArrayPositions()
-					locSizePrefix += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
-						loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
+					if UseStreamVByte {
+						locSizePrefix += 5 + len(ap)
+					} else {
+						locSizePrefix += totalUvarintBytes(uint64(fieldsMap[loc.Field()]-1),
+							loc.Pos(), loc.Start(), loc.End(), uint64(len(ap)), ap)
+					}
 				}
 
 				err = locEncoder.Add1(hitNewDocNum, uint64(locSizePrefix))

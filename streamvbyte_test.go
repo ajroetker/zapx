@@ -28,11 +28,11 @@ import (
 func TestStreamVByteChunkedIntCoderRoundTrip(t *testing.T) {
 	// Simulate location data: fieldID, pos, start, end, numArrayPos, [arrayPos...]
 	testData := [][]uint64{
-		{0, 1, 0, 5, 0},                     // Simple location, no array positions
-		{0, 2, 5, 10, 2, 0, 1},              // Location with 2 array positions
-		{1, 3, 10, 20, 3, 0, 1, 2},          // Different field, 3 array positions
-		{0, 100, 500, 600, 1, 5},            // Larger offsets
-		{2, 1000, 5000, 6000, 0},            // Even larger offsets
+		{0, 1, 0, 5, 0},            // Simple location, no array positions
+		{0, 2, 5, 10, 2, 0, 1},     // Location with 2 array positions
+		{1, 3, 10, 20, 3, 0, 1, 2}, // Different field, 3 array positions
+		{0, 100, 500, 600, 1, 5},   // Larger offsets
+		{2, 1000, 5000, 6000, 0},   // Even larger offsets
 	}
 
 	coder := newStreamVByteChunkedIntCoder(1024, 100)
@@ -105,6 +105,67 @@ func TestStreamVByteChunkedIntCoderRoundTrip(t *testing.T) {
 			if got != expected {
 				t.Errorf("Mismatch at loc %d, field %d: got %d, want %d", i, j, got, expected)
 			}
+		}
+	}
+}
+
+func TestStreamVByteColumnarLocationCountClampedToChunk(t *testing.T) {
+	origUseColumnar := UseColumnarLocations
+	UseColumnarLocations = true
+	defer func() {
+		UseColumnarLocations = origUseColumnar
+	}()
+
+	coder := newStreamVByteChunkedIntCoder(1024, 100)
+
+	// Simulate an old malformed merge output where the per-document location
+	// prefix was a byte count instead of the number of StreamVByte values.
+	if err := coder.Add1(0, 100); err != nil {
+		t.Fatalf("Add1 count failed: %v", err)
+	}
+	if err := coder.Add(0, 0, 1, 10, 20, 0); err != nil {
+		t.Fatalf("Add location failed: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Close panicked with oversized location count: %v", r)
+			}
+		}()
+		coder.Close()
+	}()
+
+	var buf bytes.Buffer
+	if _, err := coder.Write(&buf); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	const testOffset = 8
+	fullBuf := make([]byte, testOffset+buf.Len())
+	copy(fullBuf[testOffset:], buf.Bytes())
+
+	decoder := newStreamVByteChunkedIntDecoder(fullBuf, testOffset, nil)
+	if err := decoder.loadChunk(0); err != nil {
+		t.Fatalf("loadChunk failed: %v", err)
+	}
+
+	gotCount, err := decoder.readUvarint()
+	if err != nil {
+		t.Fatalf("read clamped count failed: %v", err)
+	}
+	if gotCount != 5 {
+		t.Fatalf("decoded location count = %d, want 5", gotCount)
+	}
+
+	want := []uint64{0, 1, 10, 20, 0}
+	for i, expected := range want {
+		got, err := decoder.readUvarint()
+		if err != nil {
+			t.Fatalf("read location value %d failed: %v", i, err)
+		}
+		if got != expected {
+			t.Fatalf("location value %d = %d, want %d", i, got, expected)
 		}
 	}
 }
@@ -190,11 +251,11 @@ func generateLocationData(numLocs int) [][]uint64 {
 	locData := make([][]uint64, numLocs)
 	for i := 0; i < numLocs; i++ {
 		// Simulate typical location patterns
-		fieldID := uint64(i % 3)           // 0-2 fields
-		pos := uint64(i + 1)               // Position 1-N
-		start := uint64(i * 10)            // Start offset
-		end := uint64(i*10 + 5 + i%5)      // End offset
-		numArrayPos := i % 4               // 0-3 array positions
+		fieldID := uint64(i % 3)      // 0-2 fields
+		pos := uint64(i + 1)          // Position 1-N
+		start := uint64(i * 10)       // Start offset
+		end := uint64(i*10 + 5 + i%5) // End offset
+		numArrayPos := i % 4          // 0-3 array positions
 
 		loc := []uint64{fieldID, pos, start, end, uint64(numArrayPos)}
 		for j := 0; j < numArrayPos; j++ {

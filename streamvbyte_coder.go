@@ -349,32 +349,45 @@ func (c *streamVByteChunkedIntCoder) closeColumnar() {
 	c.colNumAPs = c.colNumAPs[:0]
 	c.colArrayPos = c.colArrayPos[:0]
 
-	// Parse location data into columns
-	// Format: [count] [fieldID, pos, start, end, numAP, (arrayPos...)]* repeated per doc
+	// Parse location data into columns.
+	// Format: [count] [fieldID, pos, start, end, numAP, (arrayPos...)]* repeated per doc.
+	// Count is trusted only up to the current chunk boundary. Older buggy merge
+	// paths could write a byte count into StreamVByte chunks; malformed prefixes
+	// must not panic background scorch merge workers.
 	idx := 0
 	for idx < len(c.chunkValues) {
-		// Read count for this document
-		count := c.chunkValues[idx]
-		c.colCounts = append(c.colCounts, count)
+		count := int(c.chunkValues[idx])
 		idx++
 
-		// Parse 'count' values as location data
-		endIdx := idx + int(count)
-		for idx < endIdx && idx+4 < len(c.chunkValues) {
+		endIdx := idx + count
+		if endIdx > len(c.chunkValues) {
+			endIdx = len(c.chunkValues)
+		}
+
+		valuesWritten := 0
+		for idx+5 <= endIdx {
 			c.colFieldIDs = append(c.colFieldIDs, c.chunkValues[idx])
 			c.colPositions = append(c.colPositions, c.chunkValues[idx+1])
 			c.colStarts = append(c.colStarts, c.chunkValues[idx+2])
 			c.colEnds = append(c.colEnds, c.chunkValues[idx+3])
 			numAP := c.chunkValues[idx+4]
+			if int(numAP) > endIdx-(idx+5) {
+				numAP = uint32(endIdx - (idx + 5))
+			}
 			c.colNumAPs = append(c.colNumAPs, numAP)
 			idx += 5
 
 			// Read array positions
-			for j := 0; j < int(numAP) && idx < endIdx; j++ {
+			for j := 0; j < int(numAP); j++ {
 				c.colArrayPos = append(c.colArrayPos, c.chunkValues[idx])
 				idx++
 			}
+			valuesWritten += 5 + int(numAP)
 		}
+		if idx < endIdx {
+			idx = endIdx
+		}
+		c.colCounts = append(c.colCounts, uint32(valuesWritten))
 	}
 
 	numDocs := len(c.colCounts)
